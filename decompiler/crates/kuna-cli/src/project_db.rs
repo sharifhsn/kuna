@@ -576,12 +576,12 @@ pub struct QueriedFunction {
     pub end_rva: u64,
     #[serde(serialize_with = "hex_address")]
     pub shard_rva: u64,
-    pub shard_file: Option<String>,
+    pub shard_file: Option<Box<str>>,
     pub name: String,
     pub size: i64,
-    pub proto: Option<String>,
-    pub code: Option<String>,
-    pub error: Option<String>,
+    pub proto: Option<Box<str>>,
+    pub code: Option<Box<str>>,
+    pub error: Option<Box<str>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -591,7 +591,7 @@ pub struct QueriedHelper {
     pub module: String,
     #[serde(serialize_with = "optional_hex_address")]
     pub head_rva: Option<u64>,
-    pub proto: Option<String>,
+    pub proto: Option<Box<str>>,
     pub body: String,
     pub site_count: i64,
 }
@@ -819,10 +819,10 @@ fn val_string(res: turso::Result<Value>) -> Result<String, String> {
     }
 }
 
-fn val_opt_string(res: turso::Result<Value>) -> Result<Option<String>, String> {
+fn val_opt_string(res: turso::Result<Value>) -> Result<Option<Box<str>>, String> {
     match res.map_err(|e| format!("column read error: {e}"))? {
         Value::Null => Ok(None),
-        Value::Text(s) => Ok(Some(s)),
+        Value::Text(s) => Ok(Some(s.into_boxed_str())),
         other => Err(format!("expected nullable text column, got {other:?}")),
     }
 }

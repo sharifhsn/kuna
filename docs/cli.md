@@ -4230,6 +4230,19 @@ functions. Address comparisons use unsigned 64-bit order. A name matches a
 substring by default. `*` and `%` are wildcards and underscores are literal.
 The database file itself is also accepted as the first argument.
 
+`kuna query <db> --helpers` lists stored helpers in module and name order.
+For repeated listings of a large helper table, create this optional index
+on a separate copy of the populated database and query that copy.
+
+```sql
+CREATE INDEX IF NOT EXISTS idx_outlined_helpers_module_name
+    ON outlined_helpers(module, name);
+```
+
+On 48,000 synthetic helper rows, the index saved 8–31% of listing time and
+added about 1.65 MiB to the database. The benefit depended on body length
+and insertion order.
+
 With debug information, `kuna functions <binary> --json` includes an
 `inline_sites` array on functions with compiler-attributed inline calls.
 Each site records `source` (`pdb` or `dwarf`), a format-scoped hex `id`, the
