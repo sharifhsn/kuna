@@ -94,6 +94,10 @@ fn main() -> ExitCode {
         eprintln!("error: {e}");
         return ExitCode::from(2);
     }
+    if let Err(e) = args::take_global_pdb(&mut rest) {
+        eprintln!("error: {e}");
+        return ExitCode::from(2);
+    }
     let follow_limit = match followimages::take_limit(&mut rest) {
         Ok(limit) => limit,
         Err(e) => {
@@ -179,6 +183,8 @@ fn usage() {
          kuna --version\n\
          \n\
          --image NAME[+NAME...] (any subcommand): load those images of a dyld shared cache\n\
+         --pdb PATH (any subcommand): load external PDB debug symbols for a PE binary\n\
+         --pdb-ignore-guid (any subcommand): apply a PDB even when CodeView GUID/age is absent or mismatches\n\
          --follow-images N (decompile, disassemble, xrefs): also load up to N images holding\n\
          a requested address outside them (default 2)\n\
          --member [NAME] (any <binary> that is an ar archive): load that member, or list the members when no NAME follows; <lib.a>:NAME is the same selection"

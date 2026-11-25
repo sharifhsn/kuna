@@ -769,6 +769,11 @@ pub struct AnalysisOutput {
     /// (kuna `armframes`) What whole-image frame recovery decided, for a
     /// `--jobs` worker to replay.
     pub arm_frames: Option<crate::aif::kuna_framereplay::ArmFrameReplay>,
+    /// (kuna `pdb`) Function prototypes recovered from PDB TPI/IPI records,
+    /// keyed by entry VMA, with an optional calling-convention prototype model.
+    pub pdb_prototypes: Vec<(u64, kuna_decomp::fspec::PrototypePieces, Option<&'static str>)>,
+    /// (kuna `pdb`) Inline call-site records recovered from `S_INLINESITE`/`S_INLINESITE2`.
+    pub inline_sites: Vec<InlineSiteFact>,
 }
 
 impl AnalysisOutput {
@@ -829,6 +834,8 @@ impl AnalysisOutput {
         self.cpp_sig.msvc.iter_mut().for_each(|(_, p, _)| fix_proto(p));
         self.cpp_sig.msvc_byval.iter_mut().for_each(|(_, d)| fix_proto(&mut d.pieces));
         self.format_sites.iter_mut().for_each(|f| fix_proto(&mut f.pieces));
+        self.pdb_prototypes.iter_mut().for_each(|(_, p, _)| fix_proto(p));
+        self.inline_sites.iter_mut().for_each(|s| fix(&mut s.inlinee_name));
         let helpers = &mut self.swift_helpers;
         helpers.symbols.iter_mut().for_each(|s| {
             if s.kind == SymKind::Data { fix_data(&mut s.name); } else { fix(&mut s.name); }
@@ -978,12 +985,30 @@ impl AnalysisOutput {
         self.cpp_sig.msvc_byval.extend(other.cpp_sig.msvc_byval);
         self.cpp_sig.msvc_builders.extend(other.cpp_sig.msvc_builders);
         self.format_sites.extend(other.format_sites);
+        self.pdb_prototypes.extend(other.pdb_prototypes);
+        self.inline_sites.extend(other.inline_sites);
         self.libctypes_glibc |= other.libctypes_glibc;
         self.libctypes_refused |= other.libctypes_refused;
         if other.arm_frames.is_some() {
             self.arm_frames = other.arm_frames;
         }
     }
+}
+
+/// (kuna `pdb`) One inlined callee instance inside a caller function,
+/// recovered from PDB `S_INLINESITE`/`S_INLINESITE2` + `ModuleInfo::inlinees()`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InlineSiteFact {
+    /// Entry VMA of the enclosing caller function.
+    pub caller_addr: u64,
+    /// Raw IPI `IdIndex` of the inlinee.
+    pub inlinee_id: u32,
+    /// Normalized name of the inlined function or method.
+    pub inlinee_name: String,
+    /// Inline nesting depth inside the caller (`0` for top-level inline sites).
+    pub depth: u16,
+    /// Sorted, non-overlapping `[start_vma, end_vma)` code byte ranges.
+    pub ranges: Vec<(u64, u64)>,
 }
 
 /// (kuna `formatstring static`) One printf/scanf-family call site whose format

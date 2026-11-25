@@ -6492,6 +6492,34 @@ fn commit_analysis_output(
         prog.arch_mut().format_call_overrides = parked;
     }
 
+    if !out.inline_sites.is_empty() {
+        let mut parked: std::collections::BTreeMap<
+            u64,
+            Vec<kuna_decomp::kuna_inlinesites::ParkedInlineSite>,
+        > = std::collections::BTreeMap::new();
+        for site in &out.inline_sites {
+            parked.entry(site.caller_addr).or_default().push(
+                kuna_decomp::kuna_inlinesites::ParkedInlineSite {
+                    inlinee_id: site.inlinee_id,
+                    inlinee_name: site.inlinee_name.clone(),
+                    depth: site.depth,
+                    ranges: site.ranges.clone(),
+                },
+            );
+        }
+        for sites in parked.values_mut() {
+            sites.sort_by(|a, b| {
+                a.ranges
+                    .first()
+                    .cmp(&b.ranges.first())
+                    .then(a.depth.cmp(&b.depth))
+                    .then(a.inlinee_id.cmp(&b.inlinee_id))
+            });
+            sites.dedup();
+        }
+        prog.arch_mut().inline_sites = parked;
+    }
+
     // (kuna `pushpadread`) The stack-argument count per format call site, carried
     // for the callee-body probe (not the varargs typing above, so independent of
     // the `formatstring` gate). gcc pushes a format call's stack arguments below
@@ -7054,6 +7082,31 @@ fn commit_analysis_output(
     //     global by-name query never reaches). Empty when the gate is off.
     for (addr, pieces) in out.cpp_dwarf.prototypes {
         let a = Address::new(Rc::clone(code_space), addr);
+        prog.arch_mut().set_function_prototype_pieces_at(&a, pieces);
+    }
+    // 5a'. (kuna `pdb`) Function prototypes recovered from PDB TPI/IPI records,
+    //      applied AFTER `cppsig` (step 5b) so PDB ground truth wins over
+    //      demangled guesses.
+    for (addr, pieces, model) in out.pdb_prototypes {
+        let a = Address::new(Rc::clone(code_space), addr);
+        let model = match model {
+            Some(name) => {
+                let m = prog
+                    .arch()
+                    .get_model(name)
+                    .filter(|m| m.get_alias_parent().is_none())
+                    .cloned();
+                if let Some(ref m) = m {
+                    prog.arch_mut().set_function_prototype_model_at(&a, Rc::clone(m));
+                }
+                m
+            }
+            None => None,
+        };
+        if msvc_applied.contains(&addr) {
+            let target = crate::assertions::ProtoTarget::At(a.clone(), String::new());
+            crate::assertions::lock_prototype_on_symbol(prog, &target, &pieces, model.as_ref());
+        }
         prog.arch_mut().set_function_prototype_pieces_at(&a, pieces);
     }
     for fact in go_prototypes {

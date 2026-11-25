@@ -42,12 +42,20 @@ use crate::pdb::codeview::CodeViewInfo;
 /// the `.pdb` source is kept OFF the per-decompilation `--option` surface (so the
 /// catalog carries a single on|off `pdb` settable, not a path-valued one).
 pub const PDB_PATH_ENV: &str = kuna_decomp::kuna_loadoptions::PDB_PATH_ENV;
+pub const PDB_IGNORE_GUID_ENV: &str = kuna_decomp::kuna_loadoptions::PDB_IGNORE_GUID_ENV;
 
 /// The explicitly supplied `.pdb` path: the load's `LoadOptions::pdb_path`, else
 /// [`PDB_PATH_ENV`]. `None` when neither names one.
 pub fn explicit_pdb_path() -> Option<PathBuf> {
     use kuna_decomp::kuna_loadoptions::{env, scoped};
     scoped(|o| o.pdb_path.clone()).unwrap_or_else(env::pdb_path)
+}
+
+/// Whether CodeView GUID/age mismatches (and absent CodeView records) should be
+/// ignored when opening a candidate `.pdb`.
+pub fn ignore_guid() -> bool {
+    use kuna_decomp::kuna_loadoptions::{env, scoped};
+    scoped(|o| o.pdb_ignore_guid).unwrap_or_else(env::pdb_ignore_guid)
 }
 
 /// Resolve the explicitly supplied `.pdb` path from [`PDB_PATH_ENV`]. `None` when
@@ -62,7 +70,7 @@ pub fn pdb_path_from_env() -> Option<PathBuf> {
 /// ([`crate::pass::AnalysisCtx::image_path`]); `None` leaves only the explicit
 /// env-var tier. Duplicates are collapsed, so a record that already names
 /// `<stem>.pdb` yields one candidate, not two.
-pub fn pdb_candidates(image_path: Option<&Path>, cv: &CodeViewInfo) -> Vec<PathBuf> {
+pub fn pdb_candidates(image_path: Option<&Path>, cv: Option<&CodeViewInfo>) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     let mut add = |p: PathBuf| {
         if !out.contains(&p) {
@@ -76,7 +84,7 @@ pub fn pdb_candidates(image_path: Option<&Path>, cv: &CodeViewInfo) -> Vec<PathB
         return out;
     };
     let dir = image.parent().unwrap_or_else(|| Path::new(""));
-    if let Some(name) = recorded_pdb_name(cv.pdb_path()) {
+    if let Some(name) = cv.and_then(|c| recorded_pdb_name(c.pdb_path())) {
         add(dir.join(name));
     }
     if let Some(stem) = image.file_stem() {
@@ -245,7 +253,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         std::env::set_var(PDB_PATH_ENV, "/explicit/one.pdb");
         let cv = rsds_recording(r"C:\build\obj\recorded.pdb");
-        let got = pdb_candidates(Some(Path::new("/bin/dir/prog.exe")), &cv);
+        let got = pdb_candidates(Some(Path::new("/bin/dir/prog.exe")), Some(&cv));
         std::env::remove_var(PDB_PATH_ENV);
         assert_eq!(
             got,
@@ -264,11 +272,11 @@ mod tests {
         // The record already names `<stem>.pdb`: one candidate, not two.
         let cv = rsds_recording("prog.pdb");
         assert_eq!(
-            pdb_candidates(Some(Path::new("/bin/dir/prog.exe")), &cv),
+            pdb_candidates(Some(Path::new("/bin/dir/prog.exe")), Some(&cv)),
             vec![PathBuf::from("/bin/dir/prog.pdb")]
         );
         // No image path (an in-memory image) and no env var: nothing to try.
-        assert!(pdb_candidates(None, &cv).is_empty());
+        assert!(pdb_candidates(None, Some(&cv)).is_empty());
     }
 
     #[test]
@@ -277,7 +285,12 @@ mod tests {
         std::env::remove_var(PDB_PATH_ENV);
         let cv = rsds_recording(r"..\..\evil");
         assert_eq!(
-            pdb_candidates(Some(Path::new("/bin/dir/prog.exe")), &cv),
+            pdb_candidates(Some(Path::new("/bin/dir/prog.exe")), Some(&cv)),
+            vec![PathBuf::from("/bin/dir/prog.pdb")]
+        );
+        // Absent CodeView record still yields explicit + stem sidecar.
+        assert_eq!(
+            pdb_candidates(Some(Path::new("/bin/dir/prog.exe")), None),
             vec![PathBuf::from("/bin/dir/prog.pdb")]
         );
     }

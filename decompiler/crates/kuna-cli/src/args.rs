@@ -32,6 +32,36 @@ pub(crate) fn take_global_image(argv: &mut Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
+/// Remove global `--pdb PATH` / `--pdb=PATH` and `--pdb-ignore-guid` flags from
+/// `argv` and export them to the loader environment so every subcommand,
+/// `decomp_dbg` subprocess, and `--jobs` worker sees the same PDB configuration.
+pub(crate) fn take_global_pdb(argv: &mut Vec<String>) -> Result<(), String> {
+    let mut i = 0;
+    while i < argv.len() {
+        if argv[i] == "--pdb" {
+            let value = argv.get(i + 1).cloned().ok_or("--pdb requires a value")?;
+            if value.is_empty() {
+                return Err("--pdb requires a value".into());
+            }
+            argv.drain(i..i + 2);
+            std::env::set_var(kuna_decomp::kuna_loadoptions::PDB_PATH_ENV, &value);
+        } else if let Some(value) = argv[i].strip_prefix("--pdb=") {
+            if value.is_empty() {
+                return Err("--pdb requires a value".into());
+            }
+            let value = value.to_string();
+            argv.remove(i);
+            std::env::set_var(kuna_decomp::kuna_loadoptions::PDB_PATH_ENV, &value);
+        } else if argv[i] == "--pdb-ignore-guid" {
+            argv.remove(i);
+            std::env::set_var(kuna_decomp::kuna_loadoptions::PDB_IGNORE_GUID_ENV, "on");
+        } else {
+            i += 1;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn report(result: Result<i32, String>) -> i32 {
     match result {
         Ok(status) => status,
@@ -70,5 +100,26 @@ mod tests {
         assert!(take_option(&argv("two words"), &mut i).unwrap_err().contains("kernelcache"));
         let mut i = 0;
         assert_eq!(take_option(&argv("IOSurface"), &mut i).unwrap().1, "IOSurface");
+    }
+
+    #[test]
+    fn take_global_pdb_parses_and_validates() {
+        let mut missing = vec!["functions".into(), "--pdb".into()];
+        assert!(take_global_pdb(&mut missing).unwrap_err().contains("--pdb requires a value"));
+
+        let mut empty_eq = vec!["functions".into(), "--pdb=".into()];
+        assert!(take_global_pdb(&mut empty_eq).unwrap_err().contains("--pdb requires a value"));
+
+        let mut argv: Vec<String> = vec![
+            "a.exe".into(),
+            "--pdb".into(),
+            "/tmp/a.pdb".into(),
+            "--pdb-ignore-guid".into(),
+            "main".into(),
+        ];
+        take_global_pdb(&mut argv).unwrap();
+        assert_eq!(argv, vec!["a.exe", "main"]);
+        std::env::remove_var(kuna_decomp::kuna_loadoptions::PDB_PATH_ENV);
+        std::env::remove_var(kuna_decomp::kuna_loadoptions::PDB_IGNORE_GUID_ENV);
     }
 }

@@ -289,4 +289,195 @@ fn pdb_cpp_publics_are_demangled() {
         .map(|entry| entry.addr.get_offset())
         .collect();
     assert_eq!(deletes, [0x140001030, 0x140001040], "both overloads are listed");
+
+    // Verify TPI struct type + typed `this` prototype recovered for `app::Box`.
+    let box_ty = prog
+        .arch()
+        .types()
+        .find_by_name("app::Box")
+        .expect("find app::Box")
+        .expect("app::Box type must be interned from TPI");
+    assert!(box_ty.get_size() > 0, "app::Box must have nonzero layout size");
+    let ctor_addr = Address::new(std::rc::Rc::clone(&code_space), 0x140001080);
+    let ctor_proto = prog
+        .arch()
+        .symboltab
+        .function_proto_pieces_across_scopes(&ctor_addr)
+        .expect("app::Box::Box must have a PDB prototype");
+    assert!(
+        ctor_proto.innames.first().map(String::as_str) == Some("this"),
+        "non-static member function must prepend `this`: {ctor_proto:?}"
+    );
+}
+
+/// Optional deep end-to-end verification against the MSVC `/O2 /Zi /GR /DEBUG:FULL`
+/// `cpp_suite.exe` + `cpp_suite.pdb` fixture when present under `/tmp/kuna_msvc_fixtures`.
+#[test]
+fn pdb_msvc_cpp_suite_full_recovery_when_present() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let exe = PathBuf::from("/tmp/kuna_msvc_fixtures/cpp_suite.exe");
+    let pdb = PathBuf::from("/tmp/kuna_msvc_fixtures/cpp_suite.pdb");
+    let stripped = PathBuf::from("/tmp/kuna_msvc_fixtures/stripped/cpp_suite_stripped.exe");
+    if !exe.exists() || !pdb.exists() || !stripped.exists() {
+        return;
+    }
+
+    std::env::remove_var(PDB_PATH_ENV);
+    std::env::remove_var(kuna_decomp::kuna_loadoptions::PDB_IGNORE_GUID_ENV);
+    let spec_roots = vec![repo_root().join("specs").to_str().unwrap().to_string()];
+
+    // 1. Full sibling PDB load.
+    let mut prog = bootstrap_from_object(exe.to_str().unwrap(), "", &spec_roots)
+        .expect("bootstrap cpp_suite.exe");
+    prog.commit_pending_analysis().expect("commit cpp_suite.exe analysis");
+
+    // Verify all expected TPI types.
+    for name in ["Vec3", "EntityKind", "BitFlags", "Entity", "Serializable", "Actor", "DiamondNode"] {
+        let ty = prog
+            .arch()
+            .types()
+            .find_by_name(name)
+            .expect("find_by_name")
+            .unwrap_or_else(|| panic!("missing TPI type `{name}`"));
+        assert!(ty.get_size() > 0, "type `{name}` must be complete, got size {}", ty.get_size());
+        if name == "EntityKind" {
+            assert!(ty.is_enum_type(), "EntityKind must be an enum");
+        }
+        if name == "BitFlags" {
+            assert!(ty.has_bitfields(), "BitFlags must carry bitfields");
+        }
+    }
+
+    // Verify typed prototypes (with `this` on member functions).
+    let code_space =
+        prog.arch().manage().get_default_code_space().expect("default code space").clone();
+    let find_func_vma = |p: &ConsoleProgram, want: &str| -> u64 {
+        p.function_entries_canonical()
+            .iter()
+            .find(|e| e.name == want)
+            .unwrap_or_else(|| panic!("missing function `{want}`"))
+            .addr
+            .get_offset()
+    };
+    for member in ["Actor::tick", "Actor::compute_score", "Actor::serialize"] {
+        let vma = find_func_vma(&prog, member);
+        let addr = Address::new(std::rc::Rc::clone(&code_space), vma);
+        let proto = prog
+            .arch()
+            .symboltab
+            .function_proto_pieces_across_scopes(&addr)
+            .unwrap_or_else(|| panic!("missing PDB prototype for `{member}`"));
+        assert_eq!(
+            proto.innames.first().map(String::as_str),
+            Some("this"),
+            "`{member}` must have `this` parameter: {proto:?}"
+        );
+    }
+    let poly_vma = find_func_vma(&prog, "run_polymorphic");
+    let poly_proto = prog
+        .arch()
+        .symboltab
+        .function_proto_pieces_across_scopes(&Address::new(std::rc::Rc::clone(&code_space), poly_vma))
+        .expect("run_polymorphic prototype");
+    assert_eq!(poly_proto.intypes.len(), 3, "run_polymorphic has 3 params");
+
+    // Verify typed globals (`g_world_origin` and `g_default_kind`).
+    let global_scope = prog.arch().symboltab.get_global_scope().expect("global scope");
+    for (gname, want_ty) in [("g_world_origin", "Vec3"), ("g_default_kind", "EntityKind")] {
+        let sids = prog.arch().symboltab.find_by_name(global_scope, gname);
+        let found_ty = sids
+            .iter()
+            .filter_map(|&sid| {
+                prog.arch()
+                    .symboltab
+                    .symbol(sid)
+                    .dtype
+                    .as_ref()
+                    .map(|t| t.get_name().to_string())
+            })
+            .find(|t| t == want_ty);
+        assert_eq!(
+            found_ty.as_deref(),
+            Some(want_ty),
+            "expected global `{gname}` typed as `{want_ty}`"
+        );
+    }
+
+    // Verify locals recovered (`buf` in `run_polymorphic`).
+    let poly_locals = prog.dwarf_locals_for(poly_vma);
+    assert!(
+        poly_locals.iter().any(|(n, _, _, _)| n == "buf"),
+        "stack local `buf` missing from run_polymorphic: {poly_locals:?}"
+    );
+    let total_locals: usize = prog
+        .function_entries_canonical()
+        .iter()
+        .map(|e| prog.dwarf_locals_for(e.addr.get_offset()).len())
+        .sum();
+
+    // Verify `S_INLINESITE` parked on `Architecture::inline_sites` (including `mix_hash_helper`
+    // inlined in all 6 `heavy_caller_1..6`!).
+    let total_inline_callers = prog.arch().inline_sites.len();
+    let total_inline_sites: usize = prog.arch().inline_sites.values().map(Vec::len).sum();
+    let mut mix_hash_sites = 0usize;
+    for idx in 1..=6 {
+        let cname = format!("heavy_caller_{idx}");
+        let cvma = find_func_vma(&prog, &cname);
+        let sites = prog
+            .arch()
+            .inline_sites
+            .get(&cvma)
+            .unwrap_or_else(|| panic!("no inline_sites parked for `{cname}`"));
+        let count = sites
+            .iter()
+            .filter(|s| s.inlinee_name == "mix_hash_helper" && !s.ranges.is_empty())
+            .count();
+        assert!(
+            count >= 2,
+            "expected >=2 mix_hash_helper inline sites in `{cname}`, got {count}"
+        );
+        mix_hash_sites += count;
+    }
+
+    let proto_count = prog
+        .function_entries_canonical()
+        .iter()
+        .filter(|e| prog.arch().symboltab.function_proto_pieces_across_scopes(&e.addr).is_some())
+        .count();
+    eprintln!(
+        "==== cpp_suite PDB summary: functions={} prototypes={} globals={} locals={} inline_callers={} inline_sites={} mix_hash_in_heavy_callers={} ====",
+        prog.function_entries_canonical().len(),
+        proto_count,
+        prog.global_data_symbols().len(),
+        total_locals,
+        total_inline_callers,
+        total_inline_sites,
+        mix_hash_sites,
+    );
+
+    // 2. Stripped copy WITHOUT PDB must be completely inert.
+    let mut bare = bootstrap_from_object(stripped.to_str().unwrap(), "", &spec_roots)
+        .expect("bootstrap stripped");
+    bare.commit_pending_analysis().expect("commit stripped");
+    assert!(bare.arch().inline_sites.is_empty(), "stripped PE without PDB must have no inline_sites");
+    assert!(
+        bare.function_entries_canonical().iter().all(|e| e.name != "run_polymorphic"),
+        "stripped PE without PDB must not name run_polymorphic"
+    );
+
+    // 3. Stripped copy WITH explicit `kuna_pdb_path` recovers everything.
+    std::env::set_var(PDB_PATH_ENV, &pdb);
+    let mut restored = bootstrap_from_object(stripped.to_str().unwrap(), "", &spec_roots)
+        .expect("bootstrap stripped with pdb");
+    std::env::remove_var(PDB_PATH_ENV);
+    restored.commit_pending_analysis().expect("commit stripped with pdb");
+    assert!(
+        restored.function_entries_canonical().iter().any(|e| e.name == "run_polymorphic"),
+        "stripped PE with --pdb must recover run_polymorphic"
+    );
+    assert_eq!(
+        restored.arch().inline_sites.len(),
+        total_inline_callers,
+        "stripped PE with --pdb must recover identical inline_sites"
+    );
 }

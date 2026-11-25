@@ -136,6 +136,7 @@ mod kuna_typedepth;
 use kuna_typedepth::TypeWalk;
 
 mod kuna_dwarfstructs;
+pub(crate) use kuna_dwarfstructs::{byte_exact_bitfield, group_bitfields};
 
 mod kuna_dwarfvariants;
 mod kuna_variantnames;

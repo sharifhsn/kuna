@@ -116,14 +116,15 @@ pub fn eligible_pdb_bodies(
     {
         return Vec::new();
     }
-    let Some(cv) = codeview::extract_codeview(bytes) else {
+    let cv = codeview::extract_codeview(bytes);
+    if cv.is_none() && !locate::ignore_guid() {
         return Vec::new();
-    };
-    let candidates = locate::pdb_candidates(image_path, &cv);
+    }
+    let candidates = locate::pdb_candidates(image_path, cv.as_ref());
     let (Some(image_base), false) = (pe_image_base(bytes), candidates.is_empty()) else {
         return Vec::new();
     };
-    let Some(mut pdb) = open_fingerprint_matched(&candidates, &cv) else {
+    let Some(mut pdb) = open_fingerprint_matched(&candidates, cv.as_ref()) else {
         return Vec::new();
     };
     let procs = walk::walk_procedures(&mut pdb, image_base);

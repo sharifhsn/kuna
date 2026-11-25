@@ -417,7 +417,7 @@ fn bitfield_bits(m: &DieSnap, type_size: int4, big_endian: bool) -> Option<(i64,
 /// `None` for a real bitfield. Such fields stay out of the bitfield list because
 /// `BitFieldPullTransform` (`p5_types/bitfield/pull.rs`) asserts in
 /// `op_destroy_recursive` when one is read through a load of exactly its bytes.
-fn byte_exact_bitfield(
+pub(crate) fn byte_exact_bitfield(
     start: i64,
     num_bits: int4,
     types: &dyn TypeFactory,
@@ -443,7 +443,7 @@ fn byte_exact_bitfield(
 /// span that covers it, the span the compiler's own access and the printer's
 /// `.`-versus-`->` test (`checkBitFieldMember`) agree on, and its least
 /// significant bit within that span read in the target's byte order.
-fn group_bitfields(
+pub(crate) fn group_bitfields(
     raw: Vec<(i64, int4, String, Rc<Datatype>)>,
     big_endian: bool,
 ) -> Vec<TypeBitField> {

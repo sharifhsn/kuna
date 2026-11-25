@@ -449,6 +449,13 @@ pub fn demangle_name(raw: &str) -> Option<String> {
     None
 }
 
+/// Normalize an undecorated MSVC display name (such as a PDB procedure or
+/// inlinee name) the same way [`demangle_name`] normalizes demangled MSVC names.
+pub(crate) fn normalize_msvc_name(name: &str) -> String {
+    let phrased = msvc_demangler_phrasing(name);
+    strip_bracket_groups(&name_msvc_special_members(&name_anonymous_namespaces(&phrased)))
+}
+
 /// Spell the MSVC name components that are not identifiers as identifiers,
 /// the way the anonymous namespace already is.
 ///

@@ -1754,6 +1754,10 @@ pub struct Architecture {
     /// overrides.  Empty unless the Listing and `formatstring` are both on.
     pub format_call_overrides:
         std::collections::BTreeMap<u64, Vec<crate::kuna_formatstring::ParkedFormatSite>>,
+    /// (kuna `pdb`) Parked inline-site records (`S_INLINESITE`/`S_INLINESITE2`)
+    /// keyed by the enclosing caller function's entry VMA.
+    pub inline_sites:
+        std::collections::BTreeMap<u64, Vec<crate::kuna_inlinesites::ParkedInlineSite>>,
     /// (kuna `pushpadread`) The number of STACK arguments each printf-family
     /// format call consumes, keyed by the call instruction's VMA -- derived from
     /// the format resolver's per-site conversion count. The callee-body probe
@@ -2731,6 +2735,7 @@ impl Architecture {
             analysis_operand_refs: false,
             analysis_formatstring: crate::kuna_formatstring::FormatStringMode::Off,
             format_call_overrides: std::collections::BTreeMap::new(),
+            inline_sites: std::collections::BTreeMap::new(),
             format_stack_args: std::rc::Rc::new(std::collections::BTreeMap::new()),
             elfmain_main_decl: None,
             format_override_callpoints: std::collections::BTreeSet::new(),

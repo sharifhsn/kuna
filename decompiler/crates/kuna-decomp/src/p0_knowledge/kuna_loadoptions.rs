@@ -32,6 +32,8 @@ use crate::options::env_toggle;
 pub const MACHO_SLICE_ENV: &str = "KUNA_MACHO_SLICE";
 /// The external `.pdb` file to apply.
 pub const PDB_PATH_ENV: &str = "kuna_pdb_path";
+/// `on` applies a `.pdb` even when the PE CodeView GUID/age is absent or mismatches.
+pub const PDB_IGNORE_GUID_ENV: &str = "KUNA_PDB_IGNORE_GUID";
 /// The external `.fid` function-ID database to apply.
 pub const FID_DB_ENV: &str = "kuna_fid_db";
 /// The FLIRT `.sig` files, or directories of them, to match.
@@ -81,6 +83,8 @@ pub struct LoadOptions {
     pub macho_slice: Option<String>,
     /// An external `.pdb` file to apply.
     pub pdb_path: Option<PathBuf>,
+    /// Apply a `.pdb` even when CodeView GUID/age is absent or mismatches.
+    pub pdb_ignore_guid: bool,
     /// An external `.fid` function-ID database to apply.
     pub fid_db: Option<PathBuf>,
     /// FLIRT `.sig` files, or directories whose `*.sig` files are all taken.
@@ -116,6 +120,7 @@ impl Default for LoadOptions {
             dyldcrossrefs: true,
             macho_slice: None,
             pdb_path: None,
+            pdb_ignore_guid: false,
             fid_db: None,
             flirt_sigs: Vec::new(),
             go_version: None,
@@ -148,6 +153,7 @@ impl LoadOptions {
             dyldcrossrefs: env::dyldcrossrefs(),
             macho_slice: env::macho_slice(),
             pdb_path: env::pdb_path(),
+            pdb_ignore_guid: env::pdb_ignore_guid(),
             fid_db: env::fid_db(),
             flirt_sigs: env::flirt_sigs(),
             go_version: env::go_version(),
@@ -309,6 +315,7 @@ pub const ENV_VARS: &[&str] = &[
     crate::kuna_dyldcache::DYLDCROSSREFS_ENV,
     MACHO_SLICE_ENV,
     PDB_PATH_ENV,
+    PDB_IGNORE_GUID_ENV,
     FID_DB_ENV,
     FLIRT_SIGS_ENV,
     crate::kuna_goreg::GOVERSION_ENV,
@@ -441,6 +448,10 @@ pub mod env {
 
     pub fn pdb_path() -> Option<PathBuf> {
         path(PDB_PATH_ENV)
+    }
+
+    pub fn pdb_ignore_guid() -> bool {
+        env_toggle(PDB_IGNORE_GUID_ENV, false)
     }
 
     pub fn fid_db() -> Option<PathBuf> {

@@ -6662,20 +6662,59 @@ every other binary's pass list is byte-identical to before the pass existed):
 - **PDB** (`pdb`, PE-only, default-on;
   `decompiler/crates/kuna-analysis/src/analyzers/pdb/mod.rs`): Windows' debug info
   lives in a separate `.pdb` the PE only fingerprints, so the pass reads the
-  CodeView record, locates the file, applies a hard **fingerprint gate**, then walks
-  the global symbol stream (S_PUB32/S_GPROC32) and renames stripped functions behind
-  the label gate. Name-level only; types and lines are deferred. A C++ public is
-  decorated (`??0Box@app@@QEAA@H@Z`), so the pass reduces it with the same
-  name-only demangler the loader applies to a COFF or ELF symbol: `app::Box::Box`,
-  nested under its namespace. MSVC spells a compiler-generated member and a
-  function-local entity with backtick-quoted phrases; those become identifiers
-  (`` Box::`scalar deleting destructor' `` is `Box::scalar_deleting_destructor`,
-  `` `ns::f'::`2'::<lambda_1> `` is `ns::f::lambda_1`), as the anonymous namespace
-  already does.
+  CodeView record, locates the file, applies a hard **fingerprint gate**, then
+  imports TPI types (`decompiler/crates/kuna-analysis/src/analyzers/pdb/types.rs`)
+  and walks both the global symbol stream and every DBI module stream
+  (`decompiler/crates/kuna-analysis/src/analyzers/pdb/walk.rs`).
+
+  The TPI type importer (`PdbTypeBuilder`) performs a single linear scan of the
+  TPI stream to populate its `TypeFinder` and a two-step forward-reference map
+  (`unique_name` first, then `(kind, name)`). It interns CodeView primitives and
+  pointer indirections, modifiers, pointers and C++ references (degrading
+  pointers-to-members cleanly), arrays (interpreting `pdb 0.8.0`'s cumulative
+  byte-size dimensions by dividing by the element size), enumerations,
+  structs/classes/interfaces, unions, `FieldList` continuation chains with a
+  cycle guard, non-virtual base classes, virtual base pointers (`__vbptr`),
+  virtual function table pointers (`__vftable` synthesized as `void **` at
+  offset 0 without dereferencing `LF_VTSHAPE`/`LF_VFTABLE`), bitfields (reusing
+  `kuna_dwarfstructs`'s `byte_exact_bitfield` and `group_bitfields` layout
+  rules), and `Procedure`/`MemberFunction` function-pointer types. Pre-interned
+  shells via `TypeFactory::kuna_declare_record` and recursion/depth guards keep
+  self-referential records finite while preserving pointer completion.
+
+  The symbol walk collects `S_PUB32` publics, `S_GDATA32`/`S_LDATA32` typed
+  globals (skipping unresolved base-address entries and compiler-generated
+  `vftable`/`RTTI` metadata), and every module's `S_GPROC32`/`S_LPROC32`/`*_ID`
+  procedures — including `static` functions absent from the global public stream.
+  For `*_ID` procedure kinds (`0x1146`, `0x1147`, `0x1156`), the procedure's type
+  field is resolved as an `IdIndex` through the IPI stream's `IdFinder` to obtain
+  the underlying TPI `TypeIndex`. Procedures emit function symbols and
+  placeholder renames, `noreturn` facts when `proc.flags.never` is set, and
+  typed prototypes (`AnalysisOutput::pdb_prototypes`, with implicit `this`
+  prepended for non-static `MemberFunction`s, parameter names from procedure-scope
+  parameter symbols, trailing `NoType` varargs, and `CV_call_e` calling-convention
+  models) committed after `cppsig` so PDB ground truth always wins over demangled
+  guesses. Stack locals are decoded from `S_BPREL32`/`S_BPREL32_ST`, `S_REGREL32`,
+  and `S_LOCAL` paired with raw-decoded `S_DEFRANGE_FRAMEPOINTER_REL`,
+  `S_DEFRANGE_FRAMEPOINTER_REL_FULL_SCOPE`, `S_DEFRANGE_REGISTER_REL`, and
+  `S_FRAMEPROC` records using conservative frame-offset translation. Inline call
+  sites (`S_INLINESITE`/`S_INLINESITE2` + `ModuleInfo::inlinees()` + IPI
+  `IdFinder`) emit `AnalysisOutput::inline_sites` and are parked on
+  `Architecture::inline_sites`
+  (`decompiler/crates/kuna-decomp/src/p1_partition/kuna_inlinesites.rs`) keyed by
+  the enclosing caller VMA.
+
+  A C++ public is decorated (`??0Box@app@@QEAA@H@Z`), so the pass reduces it with
+  the same name-only demangler the loader applies to a COFF or ELF symbol:
+  `app::Box::Box`, nested under its namespace. MSVC spells a compiler-generated
+  member and a function-local entity with backtick-quoted phrases; those become
+  identifiers (`` Box::`scalar deleting destructor' `` is
+  `Box::scalar_deleting_destructor`, `` `ns::f'::`2'::<lambda_1> `` is
+  `ns::f::lambda_1`), as the anonymous namespace already does.
 
   Locating it is a short ordered search
   (`decompiler/crates/kuna-analysis/src/analyzers/pdb/locate.rs (pdb_candidates)`),
-  most specific first: an explicit path in `kuna_pdb_path`, then the CodeView
+  most specific first: an explicit path via `--pdb PATH` (`kuna_pdb_path`), then the CodeView
   record's own filename resolved **beside the image**, then `<image stem>.pdb`
   beside the image. The middle tier is the one a `/Zi` build makes free — the
   linker writes the name of the `.pdb` it emitted into the binary, and in a normal
@@ -6692,13 +6731,17 @@ every other binary's pass list is byte-identical to before the pass existed):
   candidate: a `.pdb` is applied only when its own `pdb_information().guid/age`
   equals the PE's record, so a stale sidecar left beside a rebuilt binary, or an
   unrelated `.pdb` that happens to share the name, is skipped rather than applied —
-  wrong names are worse than no names. A skipped-because-mismatched candidate gets
+  wrong names are worse than no names. Passing `--pdb-ignore-guid`
+  (`KUNA_PDB_IGNORE_GUID`) overrides the fingerprint check (including on a PE
+  without a CodeView directory) and logs one `[kuna pdb]` note on stderr when a
+  mismatch or absent record is bypassed. A skipped-because-mismatched candidate gets
   one `[kuna pdb]` line on stderr naming it: once the search is automatic, silence
   would make "your `.pdb` is stale" indistinguishable from "there is no `.pdb`
   here". A candidate that simply does not exist is not reported; most images have no
   sidecar, and that is not a defect. The cost of the search is per *load* — at most
-  three `open` attempts, only on a PE that carries a CodeView record — and the
-  `.pdb` is parsed only when one of them opens and matches.
+  three `open` attempts, only on a PE that carries a CodeView record (or when
+  `--pdb-ignore-guid` is set) — and the `.pdb` is parsed only when one of them opens
+  and matches.
 - **CVF trace** (`cvftrace`, PE32 i386 only, default `on`;
   `decompiler/crates/kuna-analysis/src/analyzers/kuna_cvftrace/mod.rs`): Compaq
   Visual Fortran links a `.trace` section of traceback records into its images,

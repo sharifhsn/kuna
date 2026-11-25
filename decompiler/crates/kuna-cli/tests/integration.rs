@@ -954,3 +954,6 @@ mod types_header;
 mod assert_storage_names;
 #[path = "bounds_checked_prototypes.rs"]
 mod bounds_checked_prototypes;
+
+#[path = "pdb_cli.rs"]
+mod pdb_cli;
