@@ -6,6 +6,10 @@ mod parser;
 #[path = "jsonfmt/writer.rs"]
 mod writer;
 
+#[path = "jsonfmt/serde_writer.rs"]
+mod serde_writer;
+
+pub(crate) use serde_writer::write_ascii_document;
 use writer::Format;
 pub(crate) use writer::UnicodeEscape;
 

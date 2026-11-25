@@ -8,10 +8,9 @@ use kuna_console::engine::FunctionEntry;
 use kuna_decomp::kuna_inlinesites::{InlineeId, ParkedInlineSite};
 use serde::ser::Error as _;
 use serde::{Serialize, Serializer};
-use serde_json::ser::{Formatter, PrettyFormatter};
 
 use crate::funcdecl::Declared;
-use crate::jsonfmt::{Json, UnicodeEscape};
+use crate::jsonfmt::{write_ascii_document, Json};
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn write(
@@ -41,14 +40,7 @@ pub(super) fn write(
         },
         limits: limits.map(JsonView),
     };
-    let mut out = io::BufWriter::with_capacity(1 << 16, out);
-    let mut serializer =
-        serde_json::Serializer::with_formatter(&mut out, AsciiPretty(PrettyFormatter::new()));
-    document
-        .serialize(&mut serializer)
-        .map_err(io::Error::from)?;
-    out.write_all(b"\n")?;
-    out.flush()
+    write_ascii_document(out, &document)
 }
 
 #[derive(Serialize)]
@@ -175,71 +167,6 @@ impl Serialize for JsonView<'_> {
     }
 }
 
-struct AsciiPretty(PrettyFormatter<'static>);
-
-impl Formatter for AsciiPretty {
-    fn write_string_fragment<W: ?Sized + Write>(
-        &mut self,
-        writer: &mut W,
-        fragment: &str,
-    ) -> io::Result<()> {
-        let mut start = 0;
-        for (offset, ch) in fragment.char_indices() {
-            if ch < '\u{7f}' {
-                continue;
-            }
-            writer.write_all(&fragment.as_bytes()[start..offset])?;
-            write!(writer, "{}", UnicodeEscape(ch))?;
-            start = offset + ch.len_utf8();
-        }
-        writer.write_all(&fragment.as_bytes()[start..])
-    }
-
-    fn begin_array<W: ?Sized + Write>(&mut self, writer: &mut W) -> io::Result<()> {
-        self.0.begin_array(writer)
-    }
-
-    fn end_array<W: ?Sized + Write>(&mut self, writer: &mut W) -> io::Result<()> {
-        self.0.end_array(writer)
-    }
-
-    fn begin_array_value<W: ?Sized + Write>(
-        &mut self,
-        writer: &mut W,
-        first: bool,
-    ) -> io::Result<()> {
-        self.0.begin_array_value(writer, first)
-    }
-
-    fn end_array_value<W: ?Sized + Write>(&mut self, writer: &mut W) -> io::Result<()> {
-        self.0.end_array_value(writer)
-    }
-
-    fn begin_object<W: ?Sized + Write>(&mut self, writer: &mut W) -> io::Result<()> {
-        self.0.begin_object(writer)
-    }
-
-    fn end_object<W: ?Sized + Write>(&mut self, writer: &mut W) -> io::Result<()> {
-        self.0.end_object(writer)
-    }
-
-    fn begin_object_key<W: ?Sized + Write>(
-        &mut self,
-        writer: &mut W,
-        first: bool,
-    ) -> io::Result<()> {
-        self.0.begin_object_key(writer, first)
-    }
-
-    fn begin_object_value<W: ?Sized + Write>(&mut self, writer: &mut W) -> io::Result<()> {
-        self.0.begin_object_value(writer)
-    }
-
-    fn end_object_value<W: ?Sized + Write>(&mut self, writer: &mut W) -> io::Result<()> {
-        self.0.end_object_value(writer)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,12 +251,8 @@ mod tests {
     fn every_unicode_scalar_has_the_legacy_escape_spelling() {
         let text: String = (0..=0x10ffff).filter_map(char::from_u32).collect();
         let mut bytes = Vec::new();
-        let mut out = io::BufWriter::with_capacity(1 << 16, &mut bytes);
-        let mut serializer =
-            serde_json::Serializer::with_formatter(&mut out, AsciiPretty(PrettyFormatter::new()));
-        text.serialize(&mut serializer).unwrap();
-        out.flush().unwrap();
-        drop(out);
+        write_ascii_document(&mut bytes, &text).unwrap();
+        assert_eq!(bytes.pop(), Some(b'\n'));
         assert_eq!(
             bytes,
             crate::jsonfmt::dumps_indent2(&Json::Str(text)).as_bytes()

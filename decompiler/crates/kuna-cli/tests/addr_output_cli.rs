@@ -166,6 +166,44 @@ fn query_preserves_unsigned_rva_order_and_literal_name_characters() {
 }
 
 #[test]
+fn helper_query_preserves_text_and_ascii_json() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().to_str().unwrap();
+    let export = run_kuna(&[
+        "decompile-project", &fixture("pdb_prog.exe"), "-o", dir, "--functions",
+        "pdb_demo_compute", "--layout", "turso", "--no-asm", "--sleighpath", &specs(),
+    ]);
+    assert!(export.status.success(), "{}", String::from_utf8_lossy(&export.stderr));
+    let body = "first line\nsecond \"é🙂\"\t";
+    tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(async {
+        let path = temp.path().join("functions.db");
+        let db = turso::Builder::new_local(path.to_str().unwrap()).build().await.unwrap();
+        db.connect().unwrap().execute(
+            "INSERT INTO outlined_helpers (id,name,module,head_rva,proto,body,site_count) \
+             VALUES ('sample','example','test',NULL,NULL,?1,1)",
+            [body],
+        ).await.unwrap();
+    });
+    let plain = run_kuna(&["query", dir, "--helpers"]);
+    assert!(plain.status.success());
+    assert_eq!(
+        plain.stdout,
+        format!("// Helper: example [test] (id=sample, sites=1)\n{body}\n\n").as_bytes()
+    );
+    let pretty = run_kuna(&["query", dir, "--helpers", "--json"]);
+    assert!(pretty.status.success());
+    let text = String::from_utf8(pretty.stdout).unwrap();
+    assert!(text.is_ascii());
+    assert!(text.contains(r#"\u00e9\ud83d\ude42"#) && text.ends_with("}\n"));
+    let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(doc["functions"], serde_json::json!([]));
+    assert_eq!(doc["helpers"], serde_json::json!([{
+        "id": "sample", "name": "example", "module": "test", "head_rva": null,
+        "proto": null, "body": body, "site_count": 1
+    }]));
+}
+
+#[test]
 fn streamed_workers_agree_on_load_time_msvc_class_layouts() {
     for (image, entry, area) in [
         ("msvc_rtti_x64.exe", "0x140001010", "0x140001040"),

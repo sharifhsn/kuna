@@ -84,3 +84,32 @@ The single-file measurement includes the JSONL index and uses a resident offset
 table for lookup. The slab, per-function and Turso measurements cover their
 backend files before the CLI adds its JSONL index. File timings include
 buffered writes. These sizes and times apply to the measured artifacts.
+
+### Query output profile, November 25
+
+The CLI validates the selected rows before writing its first byte. It now
+formats those rows directly through the shared JSON writer or a buffered text
+writer. The previous implementation also allocated a JSON tree and the entire
+formatted document for JSON, or a second large string for text.
+
+| 48,000-row query | Output bytes | Median elapsed before → after | Median peak RSS before → after |
+|---|---:|---:|---:|
+| Inclusive range, JSON | 36,481,850 | 376.5 → 218.4 ms | 212.8 → 65.7 MiB |
+| Inclusive range, text | 26,585,933 | 162.2 → 146.5 ms | 93.6 → 65.9 MiB |
+
+Each measurement used seven alternating pairs of native processes on Aster,
+with the same synthetic database and Cargo test profile. The control was
+`2e38cf098220`. All ten output cases matched byte for byte. Both versions
+returned an error with empty stdout for a malformed second row, exited
+successfully on a closed pipe, and reported a full output device as an error.
+A single-row text lookup took 5.52 ms before and 5.55 ms after. The CLI binary
+in this build profile grew by 26,088 bytes before packaging.
+
+On the four existing Aster executables, LLVM 19's `--strip-debug` saved
+3,829,624 bytes. These inputs had no source debug sections. The compact
+copies retained identical program headers, allocated sections and output from
+`nm -n --defined-only`. The standalone compiler lost 73 file-name symbol
+entries. A separate trial sharing one executable between the CLI, console and
+SLEIGH compiler saved 44.7 MiB. It also raised the toy compile's median from
+3.87 to 5.64 ms and its peak RSS from 4,402 to 11,334 KiB. The delivered
+layout keeps the four separate entry points.

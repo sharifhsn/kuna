@@ -1,6 +1,8 @@
 //! Embedded Turso (`functions.db`) backend for `kuna decompile-project` and `kuna query`.
 
+use serde::{Serialize, Serializer};
 use std::collections::BTreeMap;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use kuna_console::engine::ConsoleProgram;
@@ -8,7 +10,7 @@ use kuna_console::project::{rva_of, FuncResult};
 use turso::{Builder, Connection, Database, Statement, Value};
 
 use crate::args::take_value;
-use crate::jsonfmt::{dumps_indent2, Json};
+use crate::jsonfmt::write_ascii_document;
 use crate::project_shards::{rva_bucket, ProjectExportOpts};
 
 pub const DB_FILE: &str = "functions.db";
@@ -550,11 +552,29 @@ fn extract_c_type_name(def: &str) -> Option<String> {
 
 const FUNCTION_COLUMNS: &str = "rva, va, end_rva, shard_rva, shard_file, name, size, proto, code, error";
 
-#[derive(Debug, Clone)]
+fn hex_address<S: Serializer>(address: &u64, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.collect_str(&format_args!("{address:#x}"))
+}
+
+fn optional_hex_address<S: Serializer>(
+    address: &Option<u64>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match address {
+        Some(value) => hex_address(value, serializer),
+        None => serializer.serialize_none(),
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct QueriedFunction {
+    #[serde(serialize_with = "hex_address")]
     pub rva: u64,
+    #[serde(serialize_with = "hex_address")]
     pub va: u64,
+    #[serde(serialize_with = "hex_address")]
     pub end_rva: u64,
+    #[serde(serialize_with = "hex_address")]
     pub shard_rva: u64,
     pub shard_file: Option<String>,
     pub name: String,
@@ -564,20 +584,20 @@ pub struct QueriedFunction {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct QueriedHelper {
     pub id: String,
     pub name: String,
     pub module: String,
+    #[serde(serialize_with = "optional_hex_address")]
     pub head_rva: Option<u64>,
     pub proto: Option<String>,
     pub body: String,
     pub site_count: i64,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct DbSummary {
-    pub meta: BTreeMap<String, String>,
+#[derive(Debug, Serialize)]
+pub struct DbCounts {
     pub functions: i64,
     pub sections: i64,
     pub types: i64,
@@ -614,9 +634,9 @@ impl ProjectDbReader {
         Ok(Self { rt, _db: db, conn })
     }
 
-    pub fn summary(&self) -> Result<DbSummary, String> {
+    pub fn summary(&self) -> Result<(BTreeMap<String, String>, DbCounts), String> {
         self.rt.block_on(async {
-            let mut summary = DbSummary::default();
+            let mut meta = BTreeMap::new();
             let mut rows = self
                 .conn
                 .query("SELECT key, value FROM meta ORDER BY key", ())
@@ -626,16 +646,18 @@ impl ProjectDbReader {
                 if let (Ok(Value::Text(k)), Ok(Value::Text(v))) =
                     (row.get_value(0), row.get_value(1))
                 {
-                    summary.meta.insert(k, v);
+                    meta.insert(k, v);
                 }
             }
-            summary.functions = count_table(&self.conn, "functions").await?;
-            summary.sections = count_table(&self.conn, "sections").await?;
-            summary.types = count_table(&self.conn, "types").await?;
-            summary.globals = count_table(&self.conn, "globals").await?;
-            summary.outlined_helpers = count_table(&self.conn, "outlined_helpers").await?;
-            summary.outlined_sites = count_table(&self.conn, "outlined_sites").await?;
-            Ok::<_, String>(summary)
+            let counts = DbCounts {
+                functions: count_table(&self.conn, "functions").await?,
+                sections: count_table(&self.conn, "sections").await?,
+                types: count_table(&self.conn, "types").await?,
+                globals: count_table(&self.conn, "globals").await?,
+                outlined_helpers: count_table(&self.conn, "outlined_helpers").await?,
+                outlined_sites: count_table(&self.conn, "outlined_sites").await?,
+            };
+            Ok::<_, String>((meta, counts))
         })
     }
 
@@ -922,157 +944,101 @@ pub fn run_query(argv: &[String]) -> i32 {
         db_path = db_path.join(DB_FILE);
     }
 
-    let reader = match ProjectDbReader::open(&db_path) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("error: {e}");
+    let document = match QueryDocument::read(&db_path, rva, range, name.as_deref(), helpers) {
+        Ok(document) => document,
+        Err(error) => {
+            eprintln!("error: {error}");
             return 1;
         }
     };
 
-    let summary = match reader.summary() {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return 1;
+    let written = crate::output::emit_streamed(|out| {
+        if json {
+            write_ascii_document(out, &document)
+        } else {
+            document.write_text(out, filters == 0)
         }
-    };
-
-    let funcs = if let Some(target_rva) = rva {
-        match reader.query_by_rva(target_rva) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("error: {e}");
-                return 1;
-            }
-        }
-    } else if let Some((start, end, inclusive)) = range {
-        match reader.query_by_range(start, end, inclusive) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("error: {e}");
-                return 1;
-            }
-        }
-    } else if let Some(ref pat) = name {
-        match reader.query_by_name(pat) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("error: {e}");
-                return 1;
-            }
-        }
-    } else {
-        Vec::new()
-    };
-
-    let helper_rows = if helpers {
-        match reader.query_helpers() {
-            Ok(h) => h,
-            Err(e) => {
-                eprintln!("error: {e}");
-                return 1;
-            }
-        }
-    } else {
-        Vec::new()
-    };
-
-    if json {
-        let meta_obj = Json::Object(
-            summary
-                .meta
-                .iter()
-                .map(|(k, v)| (k.clone(), Json::Str(v.clone())))
-                .collect(),
-        );
-        let counts_obj = Json::Object(vec![
-            ("functions".into(), Json::Number(summary.functions.to_string())),
-            ("sections".into(), Json::Number(summary.sections.to_string())),
-            ("types".into(), Json::Number(summary.types.to_string())),
-            ("globals".into(), Json::Number(summary.globals.to_string())),
-            ("outlined_helpers".into(), Json::Number(summary.outlined_helpers.to_string())),
-            ("outlined_sites".into(), Json::Number(summary.outlined_sites.to_string())),
-        ]);
-        let funcs_json = Json::Array(funcs.iter().map(func_to_json).collect());
-        let helpers_json = Json::Array(helper_rows.iter().map(helper_to_json).collect());
-        let root = Json::Object(vec![
-            ("db".into(), Json::Str(db_path.display().to_string())),
-            ("meta".into(), meta_obj),
-            ("counts".into(), counts_obj),
-            ("functions".into(), funcs_json),
-            ("helpers".into(), helpers_json),
-        ]);
-        let text = format!("{}\n", dumps_indent2(&root));
-        return crate::output::emit_with_status(&text, 0);
-    }
-
-    let mut out = String::new();
-    if filters == 0 {
-        out.push_str(&format!("database: {}\n", db_path.display()));
-        for (k, v) in &summary.meta {
-            out.push_str(&format!("  {k}: {v}\n"));
-        }
-        out.push_str(&format!(
-            "  counts: {} functions, {} sections, {} types, {} globals, {} helpers, {} sites\n",
-            summary.functions,
-            summary.sections,
-            summary.types,
-            summary.globals,
-            summary.outlined_helpers,
-            summary.outlined_sites
-        ));
-    } else if helpers {
-        for h in &helper_rows {
-            out.push_str(&format!(
-                "// Helper: {} [{}] (id={}, sites={})\n{}\n\n",
-                h.name, h.module, h.id, h.site_count, h.body
-            ));
-        }
-    } else {
-        for f in &funcs {
-            out.push_str(&format!(
-                "// Function: {} @ 0x{:x} (rva 0x{:x}..0x{:x}, size {})\n",
-                f.name, f.va, f.rva, f.end_rva, f.size
-            ));
-            if let Some(code) = &f.code {
-                out.push_str(code);
-                out.push_str("\n\n");
-            } else if let Some(err) = &f.error {
-                out.push_str(&format!("// error: {err}\n\n"));
-            } else if let Some(proto) = &f.proto {
-                out.push_str(&format!("{proto}\n\n"));
-            }
-        }
-    }
-    crate::output::emit_with_status(&out, 0)
+    });
+    written.map_or_else(|error| crate::output::status_after(error, 0), |()| 0)
 }
 
-fn func_to_json(f: &QueriedFunction) -> Json {
-    Json::Object(vec![
-        ("rva".into(), Json::Str(format!("0x{:x}", f.rva))),
-        ("va".into(), Json::Str(format!("0x{:x}", f.va))),
-        ("end_rva".into(), Json::Str(format!("0x{:x}", f.end_rva))),
-        ("shard_rva".into(), Json::Str(format!("0x{:x}", f.shard_rva))),
-        ("shard_file".into(), f.shard_file.clone().map_or(Json::Null, Json::Str)),
-        ("name".into(), Json::Str(f.name.clone())),
-        ("size".into(), Json::Number(f.size.to_string())),
-        ("proto".into(), f.proto.clone().map_or(Json::Null, Json::Str)),
-        ("code".into(), f.code.clone().map_or(Json::Null, Json::Str)),
-        ("error".into(), f.error.clone().map_or(Json::Null, Json::Str)),
-    ])
+#[derive(Serialize)]
+struct QueryDocument {
+    db: String,
+    meta: BTreeMap<String, String>,
+    counts: DbCounts,
+    functions: Vec<QueriedFunction>,
+    helpers: Vec<QueriedHelper>,
 }
 
-fn helper_to_json(h: &QueriedHelper) -> Json {
-    Json::Object(vec![
-        ("id".into(), Json::Str(h.id.clone())),
-        ("name".into(), Json::Str(h.name.clone())),
-        ("module".into(), Json::Str(h.module.clone())),
-        ("head_rva".into(), h.head_rva.map_or(Json::Null, |v| Json::Str(format!("0x{v:x}")))),
-        ("proto".into(), h.proto.clone().map_or(Json::Null, Json::Str)),
-        ("body".into(), Json::Str(h.body.clone())),
-        ("site_count".into(), Json::Number(h.site_count.to_string())),
-    ])
+impl QueryDocument {
+    fn read(
+        path: &Path,
+        rva: Option<u64>,
+        range: Option<(u64, u64, bool)>,
+        name: Option<&str>,
+        helpers: bool,
+    ) -> Result<Self, String> {
+        let reader = ProjectDbReader::open(path)?;
+        let (meta, counts) = reader.summary()?;
+        let functions = if let Some(target) = rva {
+            reader.query_by_rva(target)?
+        } else if let Some((start, end, inclusive)) = range {
+            reader.query_by_range(start, end, inclusive)?
+        } else if let Some(pattern) = name {
+            reader.query_by_name(pattern)?
+        } else {
+            Vec::new()
+        };
+        let helpers = if helpers {
+            reader.query_helpers()?
+        } else {
+            Vec::new()
+        };
+        Ok(Self {
+            db: path.display().to_string(),
+            meta,
+            counts,
+            functions,
+            helpers,
+        })
+    }
+
+    fn write_text(&self, out: &mut dyn Write, summary: bool) -> io::Result<()> {
+        if summary {
+            writeln!(out, "database: {}", self.db)?;
+            for (key, value) in &self.meta {
+                writeln!(out, "  {key}: {value}")?;
+            }
+            let counts = &self.counts;
+            writeln!(
+                out,
+                "  counts: {} functions, {} sections, {} types, {} globals, {} helpers, {} sites",
+                counts.functions, counts.sections, counts.types, counts.globals,
+                counts.outlined_helpers, counts.outlined_sites
+            )?;
+        }
+        for helper in &self.helpers {
+            writeln!(
+                out, "// Helper: {} [{}] (id={}, sites={})\n{}\n",
+                helper.name, helper.module, helper.id, helper.site_count, helper.body
+            )?;
+        }
+        for function in &self.functions {
+            writeln!(
+                out, "// Function: {} @ 0x{:x} (rva 0x{:x}..0x{:x}, size {})",
+                function.name, function.va, function.rva, function.end_rva, function.size
+            )?;
+            if let Some(code) = &function.code {
+                writeln!(out, "{code}\n")?;
+            } else if let Some(error) = &function.error {
+                writeln!(out, "// error: {error}\n")?;
+            } else if let Some(proto) = &function.proto {
+                writeln!(out, "{proto}\n")?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1120,8 +1086,8 @@ mod tests {
         assert!(size > 0);
 
         let reader = ProjectDbReader::open(&db_path).unwrap();
-        let summary = reader.summary().unwrap();
-        assert_eq!(summary.functions, 2);
+        let (_, counts) = reader.summary().unwrap();
+        assert_eq!(counts.functions, 2);
 
         let exact = reader.query_by_rva(0x1000).unwrap();
         assert_eq!(exact.len(), 1);
