@@ -46,6 +46,9 @@ mod declared_bytes_cli;
 #[path = "scale_bounds_cli.rs"]
 mod scale_bounds_cli;
 
+#[path = "addr_output_cli.rs"]
+mod addr_output_cli;
+
 #[path = "argument_errors_cli.rs"]
 mod argument_errors_cli;
 

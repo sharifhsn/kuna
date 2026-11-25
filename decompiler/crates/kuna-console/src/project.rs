@@ -331,6 +331,15 @@ pub fn decompile_export_targets_watched(
     decompile_batch(prog, targets, &opts, landed)
 }
 
+pub fn decompile_export_targets_with_options(
+    prog: &mut ConsoleProgram,
+    targets: Vec<FunctionEntry>,
+    opts: &DecompileOptions,
+    landed: &mut dyn FnMut(&FuncResult),
+) -> Vec<FuncResult> {
+    decompile_batch(prog, targets, opts, landed)
+}
+
 /// The options [`decompile_export_targets`] runs with, for a driver that owns
 /// the loop itself (the callee-first order) and still wants the export's answer.
 pub fn export_options(single_target: bool) -> DecompileOptions {
@@ -2839,6 +2848,11 @@ pub struct ReadmeSectionRow {
 /// Snapshotted from the `ConsoleProgram` on the thread that owns it
 /// ([`Self::snapshot`]), so a streamed export can keep rewriting its README from
 /// a writer thread that never sees the program.
+/// Compute the relative virtual address (RVA) of `vma` against `image_base`.
+pub fn rva_of(vma: u64, image_base: u64) -> u64 {
+    vma.checked_sub(image_base).unwrap_or(vma)
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ReadmeFacts {
     /// The path string printed in the `| Path |` row (the CLI passes the
@@ -2851,6 +2865,9 @@ pub struct ReadmeFacts {
     /// The loader's description line.  `None` before the program is loaded, and
     /// every program-derived row then prints `pending`.
     pub description: Option<String>,
+    /// The container's preferred load base (`ImageBase` on PE, lowest `PT_LOAD`
+    /// on ELF, `__TEXT` vmaddr on Mach-O).
+    pub image_base: Option<u64>,
     /// The image entry point, resolved through the inventory so an ARM entry
     /// carrying the Thumb mode bit prints at the even address the rest of the
     /// export uses.
@@ -2866,6 +2883,7 @@ impl ReadmeFacts {
             file_name: file_name.to_string(),
             file_size: std::fs::metadata(binary_path).map(|m| m.len()).ok(),
             description: None,
+            image_base: None,
             entry: None,
             sections: Vec::new(),
         }
@@ -2882,6 +2900,7 @@ impl ReadmeFacts {
         let metadata = prog.image_metadata();
         Self {
             description: Some(prog.description().to_string()),
+            image_base: metadata.and_then(|value| value.image_base),
             entry: metadata
                 .and_then(|value| value.entry)
                 .map(|vma| prog.find_entry_at(vma).map_or(vma, |entry| entry.addr.get_offset())),
@@ -3114,6 +3133,9 @@ fn render_readme_inner(
     match &facts.description {
         Some(description) => out.push_str(&format!("| Architecture | `{description}` |\n")),
         None => out.push_str("| Architecture | pending |\n"),
+    }
+    if let Some(base) = facts.image_base {
+        out.push_str(&format!("| Image base | `0x{base:x}` |\n"));
     }
     match (&facts.description, facts.entry) {
         (None, _) => out.push_str("| Entry point | pending |\n"),

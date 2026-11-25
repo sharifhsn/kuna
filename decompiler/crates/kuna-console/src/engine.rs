@@ -249,6 +249,7 @@ pub use kuna_analysis::loadimage_object::ObjectSectionMetadata as ProgramSection
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProgramImageMetadata {
     pub entry: Option<u64>,
+    pub image_base: Option<u64>,
     pub sections: Vec<ProgramSectionMetadata>,
 }
 
@@ -836,6 +837,10 @@ impl ConsoleProgram {
 
     pub fn image_metadata(&self) -> Option<&ProgramImageMetadata> {
         self.image_metadata.as_ref()
+    }
+
+    pub fn image_base(&self) -> u64 {
+        self.image_metadata.as_ref().and_then(|m| m.image_base).unwrap_or(0)
     }
 
     /// The loader's header-tolerance notes for this image (a section table it
@@ -5001,6 +5006,11 @@ pub(crate) fn bootstrap_raw_image(
     prog.pending_analysis = input_isa_stash(input_context_paints);
     prog.analysis_code_space = Some(code_space);
     prog.raw_address_units = Some((word_size, arm32));
+    prog.image_metadata = Some(ProgramImageMetadata {
+        entry: None,
+        image_base: Some(image_base),
+        sections: Vec::new(),
+    });
     Ok(prog)
 }
 
@@ -5159,7 +5169,11 @@ pub(crate) fn bootstrap_mz_bytes(
     }
     program.arch_mut().fpu_emu_evidence = fpu_emu_evidence;
     kuna_decomp::kuna_fpuemu::apply(program.arch());
-    program.image_metadata = Some(ProgramImageMetadata { entry: Some(entry), sections: Vec::new() });
+    program.image_metadata = Some(ProgramImageMetadata {
+        entry: Some(entry),
+        image_base: Some(image.base),
+        sections: Vec::new(),
+    });
     program.mz_evidence = Some(evidence);
     let mapped = program.sections();
     if let Some(space) = program.analysis_code_space.clone() {
@@ -5288,8 +5302,11 @@ pub(crate) fn bootstrap_te_bytes(
         kuna_decomp::kuna_litpoolconst::code_const_ranges(&loader.file_backed_segments(), &[]);
     let readonly_ranges = loader_readonly_ranges(&loader, sleigh.base().unwrap().manage());
     let entry = loader.entry();
-    let image_metadata =
-        ProgramImageMetadata { entry: Some(entry), sections: loader.section_metadata() };
+    let image_metadata = ProgramImageMetadata {
+        entry: Some(entry),
+        image_base: Some(loader.image_base()),
+        sections: loader.section_metadata(),
+    };
     sleigh.base_mut().unwrap().runtime_code_relocation = loader.runtime_code_relocation();
     sleigh.base_mut().unwrap().set_loader(Box::new(loader));
     let input_context_paints = install_input_isa(
@@ -5696,6 +5713,7 @@ pub(crate) fn bootstrap_object(
     // The container entry and named section table, for the project README.
     let image_metadata = ProgramImageMetadata {
         entry: loader.image_entry(),
+        image_base: loader.image_base(),
         sections: loader.section_metadata().to_vec(),
     };
 

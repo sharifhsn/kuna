@@ -142,6 +142,7 @@ pub struct TeLoadImage {
     fallback_archtype: Option<Vec<u8>>,
     sections: Vec<TeSection>,
     entry: u64,
+    image_base: u64,
     machine_thumb_hint: bool,
     entry_thumb_hint: bool,
     base_relocations: bool,
@@ -472,6 +473,7 @@ impl TeLoadImage {
             fallback_archtype,
             sections,
             entry,
+            image_base,
             machine_thumb_hint: decodes_as_arm32
                 && info.mode_policy == Some(ArmModePolicy::WholeImageThumb),
             entry_thumb_hint: decodes_as_arm32
@@ -560,6 +562,10 @@ impl TeLoadImage {
 
     pub fn entry(&self) -> u64 {
         self.entry
+    }
+
+    pub fn image_base(&self) -> u64 {
+        self.image_base
     }
 
     /// Whether the image keeps base relocations, so firmware may load it

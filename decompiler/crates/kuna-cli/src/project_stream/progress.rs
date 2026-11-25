@@ -11,20 +11,21 @@
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
 use kuna_console::engine::ConsoleProgram;
-use kuna_console::project::{render_c, AsmPhase, FuncResult, ReadmeFacts, StreamPhase};
+use kuna_console::project::{AsmPhase, FuncResult, ReadmeFacts, StreamPhase};
 
 use super::{
     create, index_line, write_atomic, Layout, StreamRun, CLOCK_GRANULARITY, INDEX_FILE,
     README_EVERY, STATUS_FILE, TICK,
 };
 use crate::decompile_all::{load_program, Args, DriverDefaults};
-use crate::decompile_project::{decompile_project, ExportWatch, ProjectCompletion};
+use crate::decompile_project::{decompile_project, ExportWatch, ProjectCompletion, WrittenSpan};
 use crate::jobs::PoolWatch;
+use crate::project_shards::ProjectExportOpts;
 
 /// The export, watched; `.streaming` is removed once every artifact is final.
 pub(super) fn export(
@@ -32,9 +33,18 @@ pub(super) fn export(
     output: Option<&str>,
     layout: &Layout,
     run: &StreamRun,
+    export_opts: ProjectExportOpts,
 ) -> Result<ProjectCompletion, String> {
-    let watch = ProgressWatch { run, layout, readme_gate: Mutex::new(()), feed: Mutex::new(Feed::default()) };
-    let completion = watch.with_clock(|| decompile_project(args, output, Some(&watch)))?;
+    let watch = ProgressWatch {
+        run,
+        layout,
+        export_opts,
+        image_base: AtomicU64::new(0),
+        readme_gate: Mutex::new(()),
+        feed: Mutex::new(Feed::default()),
+    };
+    let completion =
+        watch.with_clock(|| decompile_project(args, output, export_opts, Some(&watch)))?;
     let status = run.dir.join(STATUS_FILE);
     std::fs::remove_file(&status).map_err(|e| format!("cannot remove {}: {e}", status.display()))?;
     Ok(completion)
@@ -50,6 +60,8 @@ struct Feed {
 struct ProgressWatch<'a> {
     run: &'a StreamRun,
     layout: &'a Layout,
+    export_opts: ProjectExportOpts,
+    image_base: AtomicU64,
     /// Held across a running-README publish and across the move to
     /// `finalizing`, so no running README lands on top of the final one.
     readme_gate: Mutex<()>,
@@ -125,10 +137,16 @@ impl ProgressWatch<'_> {
         let mut feed = self.feed.lock().unwrap_or_else(|e| e.into_inner());
         let Feed { file, seq } = &mut *feed;
         let Some(out) = file.as_mut() else { return };
+        let image_base = self.image_base.load(Ordering::SeqCst);
+        let default_c_file = self
+            .export_opts
+            .layout
+            .writes_single_c()
+            .then(|| format!("{}.c", self.layout.file_name));
         let lines: String = results
             .iter()
             .enumerate()
-            .map(|(k, r)| index_line(*seq + k, r, None))
+            .map(|(k, r)| index_line(*seq + k, r, image_base, default_c_file.as_deref(), None))
             .collect();
         *seq += results.len();
         if let Err(e) = out.write_all(lines.as_bytes()) {
@@ -178,6 +196,7 @@ impl ExportWatch for ProgressWatch<'_> {
     }
 
     fn decompiling(&self, prog: &ConsoleProgram, total: usize) -> Result<(), String> {
+        self.image_base.store(prog.image_base(), Ordering::SeqCst);
         let facts = ReadmeFacts::snapshot(
             &self.layout.binary_path,
             &self.layout.path_label,
@@ -199,28 +218,31 @@ impl ExportWatch for ProgressWatch<'_> {
 
     fn finalizing(&self) {
         self.enter_finalizing();
-        self.run.set_asm_phase(AsmPhase::Sweeping);
+        if !self.export_opts.no_asm {
+            self.run.set_asm_phase(AsmPhase::Sweeping);
+        } else {
+            self.run.set_asm_phase(AsmPhase::Complete);
+        }
         self.run.publish_progress(false);
     }
 
     fn written(
         &self,
         out_dir: &Path,
-        file_name: &str,
+        image_base: u64,
         results: &[FuncResult],
+        spans: &[WrittenSpan],
+        c_bytes: u64,
     ) -> Result<Vec<(String, usize)>, String> {
         self.feed.lock().unwrap_or_else(|e| e.into_inner()).file = None;
-        let mut offset = format!("#include \"{file_name}.h\"\n\n").len() as u64;
         let mut index = String::new();
-        for (seq, r) in results.iter().enumerate() {
-            let len = render_c(std::slice::from_ref(r)).len();
-            index.push_str(&index_line(seq, r, Some((offset, len))));
-            offset += len as u64;
+        for (seq, (r, span)) in results.iter().zip(spans.iter()).enumerate() {
+            index.push_str(&index_line(seq, r, image_base, span.c_file.as_deref(), span.span));
         }
         write_atomic(&out_dir.join(INDEX_FILE), index.as_bytes())?;
         {
             let mut shared = self.run.lock();
-            shared.status.c_bytes = offset;
+            shared.status.c_bytes = c_bytes;
             shared.status.asm = AsmPhase::Complete;
         }
         Ok(vec![(INDEX_FILE.to_string(), index.len())])

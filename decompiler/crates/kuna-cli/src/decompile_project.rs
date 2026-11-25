@@ -51,35 +51,79 @@
 //! decompile-project core (`kuna_console::project` — also reused by the
 //! `kuna_wasm` front-end); this module keeps the CLI wrapper + orchestration.
 
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use kuna_console::engine::ConsoleProgram;
 use kuna_console::project::{
-    build_asm, build_c, build_header, build_readme, collect_dat_addrs,
-    decompile_export_targets_watched, BatchOutcome, FuncResult,
+    build_asm, build_header, build_readme, collect_dat_addrs,
+    decompile_export_targets_with_options, export_options, render_c, rva_of, BatchOutcome,
+    FuncResult,
 };
 use kuna_decomp::decompile_drive::{print_c_recompile_prelude, print_c_types};
 
 use crate::decompile_all::{
-    decompile_targets_pooled, load_program, parse_args, resolve_targets, synth_base, Args,
-    DriverDefaults,
+    decompile_targets_pooled_with_hints, load_program, parse_args, resolve_targets, synth_base,
+    Args, DriverDefaults,
 };
 use crate::jobs::PoolWatch;
+use crate::project_db::{ProjectDbWriter, DB_FILE};
+use crate::project_shards::{
+    parse_shard_align, OutputLayout, ProjectExportOpts, ShardWriter, DEFAULT_SHARD_ALIGN,
+    SHARDS_MANIFEST,
+};
 use crate::project_stream::StreamMode;
 
 /// `kuna decompile-project` entry point.
 pub fn run(argv: &[String]) -> i32 {
-    // Wrapper parse: extract `-o/--output`, intercept help, reject the
-    // decompile-all-only flags, and hand the remainder to the shared parser.
+    // Wrapper parse: extract `-o/--output`, layout/sharding flags, intercept help,
+    // reject the decompile-all-only flags, and hand the remainder to the shared parser.
     let mut output: Option<String> = None;
     let mut stream = false;
     let mut progress = false;
+    let mut layout = OutputLayout::Single;
+    let mut shard_align = DEFAULT_SHARD_ALIGN;
+    let mut no_asm = false;
     let mut rest: Vec<String> = Vec::new();
     let mut i = 0;
     while i < argv.len() {
         match argv[i].as_str() {
             "--stream" => stream = true,
             "--progress" => progress = true,
+            "--no-asm" => no_asm = true,
+            "--layout" => {
+                if i + 1 >= argv.len() {
+                    eprintln!("error: --layout requires a value");
+                    usage();
+                    return 2;
+                }
+                match OutputLayout::parse(&argv[i + 1]) {
+                    Ok(v) => layout = v,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        usage();
+                        return 2;
+                    }
+                }
+                i += 1;
+            }
+            "--shard-align" => {
+                if i + 1 >= argv.len() {
+                    eprintln!("error: --shard-align requires a value");
+                    usage();
+                    return 2;
+                }
+                match parse_shard_align(&argv[i + 1]) {
+                    Ok(v) => shard_align = v,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        usage();
+                        return 2;
+                    }
+                }
+                i += 1;
+            }
             "-o" | "--output" => {
                 if i + 1 >= argv.len() {
                     eprintln!("error: {} requires a value", argv[i]);
@@ -110,6 +154,7 @@ pub fn run(argv: &[String]) -> i32 {
             return 2;
         }
     };
+    let export_opts = ProjectExportOpts { layout, shard_align, no_asm };
     // `--stream` already reports progress, so it wins when both are given.
     let mode = if stream {
         Some(StreamMode::Stream)
@@ -134,9 +179,9 @@ pub fn run(argv: &[String]) -> i32 {
             if mode == StreamMode::Stream {
                 crate::decompile_all::warn_protoorder_inert(&args.options, "decompile-project --stream");
             }
-            crate::project_stream::run(&args, output.as_deref(), mode)
+            crate::project_stream::run(&args, output.as_deref(), mode, export_opts)
         }
-        None => decompile_project(&args, output.as_deref(), None),
+        None => decompile_project(&args, output.as_deref(), export_opts, None),
     };
     match run {
         Ok(completion) => emit_completion(completion),
@@ -167,6 +212,8 @@ fn usage() {
     eprintln!(
         "usage: kuna decompile-project <binary> [-o|--output DIR] [--functions a,b,..] \\\n\
          \x20                   [--addr 0xVMA].. [--max-fn-seconds N] [--max-fn-memory MiB] \\\n\
+         \x20                   [--layout single|rva-slab|rva-file|turso|both] \\\n\
+         \x20                   [--shard-align N] [--no-asm] \\\n\
          \x20                   [--mode auto|reliable|aggressive|fast] \\\n\
          \x20                   [--jobs N|auto] [--jobs-chunk N] [--jobs-full-load] \\\n\
          \x20                   [--stream | --progress] \\\n\
@@ -180,8 +227,16 @@ fn usage() {
          \x20 <name>.h    recompile prelude + type definitions + globals named by\n\
          \x20             address + prototypes\n\
          \x20 <name>.asm  labeled disassembly (function labels, stack-var comments,\n\
-         \x20             dat_<hex> data labels with raw bytes)\n\
-         \x20 README.md   binary metadata (size, arch, entry, sections, counts)\n\
+         \x20             dat_<hex> data labels with raw bytes; skipped with --no-asm)\n\
+         \x20 README.md   binary metadata (size, arch, image base, entry, sections, counts)\n\
+         --layout controls how function C bodies are stored (default: single):\n\
+         \x20 single      one monolithic <name>.c (default)\n\
+         \x20 rva-slab    memory-aligned RVA slab files under slabs/rva_<bucket>.c + shards.json\n\
+         \x20 rva-file    one file per function under funcs/rva_<bucket>/0x<rva>.c + shards.json\n\
+         \x20 turso       embedded SQLite-compatible functions.db (query with `kuna query`)\n\
+         \x20 both        both rva-slab and functions.db\n\
+         --shard-align sets the power-of-two RVA bucket granularity (default 0x10000 = 64 KiB).\n\
+         --no-asm skips generating <name>.asm.\n\
          Unfiltered fast exports default to 10 seconds per function; other runs\n\
          default to 120. --max-fn-seconds overrides that policy (0 disables).\n\
          --max-fn-memory MiB stops a function once the process decompiling it\n\
@@ -213,6 +268,11 @@ fn usage() {
     );
 }
 
+pub(crate) struct WrittenSpan {
+    pub(crate) c_file: Option<String>,
+    pub(crate) span: Option<(u64, usize)>,
+}
+
 /// What a `--progress` export observes of [`decompile_project`]:
 /// the same export, reported on while it runs.
 pub(crate) trait ExportWatch: PoolWatch {
@@ -222,21 +282,24 @@ pub(crate) trait ExportWatch: PoolWatch {
     fn decompiling(&self, prog: &ConsoleProgram, total: usize) -> Result<(), String>;
     /// The artifacts are about to be built and written.
     fn finalizing(&self);
-    /// The four artifacts are written; `results` are in the `.c`'s order.  Returns
+    /// The artifacts are written; `results` and `spans` are in address order. Returns
     /// any further files it wrote, for the completion summary.
     fn written(
         &self,
         out_dir: &Path,
-        file_name: &str,
+        image_base: u64,
         results: &[FuncResult],
+        spans: &[WrittenSpan],
+        c_bytes: u64,
     ) -> Result<Vec<(String, usize)>, String>;
 }
 
 /// The whole flow: load once → decompile every target (with prototypes) →
-/// build the four artifacts → write them all at the end.
+/// build the artifacts → write them all at the end.
 pub(crate) fn decompile_project(
     args: &Args,
     output: Option<&str>,
+    export_opts: ProjectExportOpts,
     watch: Option<&dyn ExportWatch>,
 ) -> Result<ProjectCompletion, String> {
     let binary_path = std::fs::canonicalize(&args.binary)
@@ -291,15 +354,7 @@ pub(crate) fn decompile_project(
         }
     };
 
-    // `--jobs N`: the per-function loop fans out over worker processes, but the
-    // parent's program stays loaded — the `.asm` section sweep and the README
-    // metadata are whole-program artifacts only it can build. The `.h` type
-    // block is the exception: `print_c_types` renders types the DECOMPILE
-    // interns, so in a sharded run it has to come back from the workers.
-    // (kuna `protoorder`) The export keeps a `structsynth` ledger, and which
-    // `struct_N` a layout becomes is decided by the order the program is
-    // visited in. So it takes `decompile-all`'s callee-first order under the
-    // same conditions: a name means the same record on both surfaces.
+    let want_hints = export_opts.layout.writes_turso();
     let whole = args.addrs.is_empty() && args.names.is_none();
     let (callee_first, explicit) =
         crate::decompile_all::callee_first_decision(&prog, args, targets.len(), whole);
@@ -313,13 +368,14 @@ pub(crate) fn decompile_project(
             );
         }
         let inventory = prog.function_entries_canonical();
-        let pooled = decompile_targets_pooled(
+        let pooled = decompile_targets_pooled_with_hints(
             args,
             &targets,
             &inventory,
             /* want_proto= */ true,
             /* want_provenance= */ false,
             /* want_types= */ true,
+            want_hints,
             load_seconds,
             synth_base(&prog),
             callee_first,
@@ -335,14 +391,17 @@ pub(crate) fn decompile_project(
                 targets.len()
             );
         }
-        let base = kuna_console::project::export_options(targets.len() == 1);
+        let mut base = export_options(targets.len() == 1);
+        base.want_callee_hints = want_hints;
         let funcs = crate::decompile_all::decompile_callee_first(
             &mut prog, args, targets, explicit, base, &mut landed,
         );
         (funcs, None)
     } else {
         crate::decompile_all::note_custom_inert(&prog, targets.len());
-        (decompile_export_targets_watched(&mut prog, targets, &mut landed), None)
+        let mut opts = export_options(targets.len() == 1);
+        opts.want_callee_hints = want_hints;
+        (decompile_export_targets_with_options(&mut prog, targets, &opts, &mut landed), None)
     };
     if let Some(watch) = watch {
         watch.finalizing();
@@ -355,31 +414,130 @@ pub(crate) fn decompile_project(
     // into the factory as functions decompile.
     let prelude = print_c_recompile_prelude(prog.arch());
     let types = pooled_types.unwrap_or_else(|| print_c_types(prog.arch_mut()));
+    let image_base = prog.image_base();
 
     let header = build_header(&file_name, &prelude, &types, &results)?;
-    let c_file = build_c(&file_name, &results);
-    let dat_addrs = collect_dat_addrs(&results);
-    let asm = build_asm(&prog, &results, &dat_addrs, &file_name);
+    let asm = if export_opts.no_asm {
+        None
+    } else {
+        let dat_addrs = collect_dat_addrs(&results);
+        Some(build_asm(&prog, &results, &dat_addrs, &file_name))
+    };
     // The CLI's `| Path |` row prints the canonicalized on-disk path (the wasm
     // front-end passes a virtual label instead), so output stays byte-identical.
-    let readme =
-        build_readme(&binary_path, &binary_path.display().to_string(), &file_name, &prog, &results);
+    let path_label = binary_path.display().to_string();
+    let readme = build_readme(&binary_path, &path_label, &file_name, &prog, &results);
 
     std::fs::create_dir_all(&out_dir)
         .map_err(|e| format!("cannot create {}: {e}", out_dir.display()))?;
     let mut sizes: Vec<(String, usize)> = Vec::new();
-    for (base, text) in [
-        (format!("{file_name}.c"), &c_file),
-        (format!("{file_name}.h"), &header),
-        (format!("{file_name}.asm"), &asm),
-        ("README.md".to_string(), &readme),
-    ] {
-        let path = out_dir.join(&base);
-        std::fs::write(&path, text).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-        sizes.push((base, text.len()));
+    let mut spans: Vec<WrittenSpan> = Vec::with_capacity(results.len());
+    let mut total_c_bytes: u64 = 0;
+
+    match export_opts.layout {
+        OutputLayout::Single => {
+            let c_name = format!("{file_name}.c");
+            let c_path = out_dir.join(&c_name);
+            let file = File::create(&c_path)
+                .map_err(|e| format!("cannot create {}: {e}", c_path.display()))?;
+            let mut writer = BufWriter::with_capacity(64 * 1024, file);
+            let include_line = format!("#include \"{file_name}.h\"\n\n");
+            writer
+                .write_all(include_line.as_bytes())
+                .map_err(|e| format!("cannot write {}: {e}", c_path.display()))?;
+            let mut offset = include_line.len() as u64;
+            for r in &results {
+                let block = render_c(std::slice::from_ref(r));
+                writer
+                    .write_all(block.as_bytes())
+                    .map_err(|e| format!("cannot write {}: {e}", c_path.display()))?;
+                spans.push(WrittenSpan {
+                    c_file: Some(c_name.clone()),
+                    span: Some((offset, block.len())),
+                });
+                offset += block.len() as u64;
+            }
+            writer
+                .flush()
+                .map_err(|e| format!("cannot flush {}: {e}", c_path.display()))?;
+            total_c_bytes = offset;
+            sizes.push((c_name, offset as usize));
+        }
+        OutputLayout::RvaSlab | OutputLayout::RvaFile | OutputLayout::Both => {
+            let mut shard_writer = ShardWriter::new(
+                &out_dir,
+                &file_name,
+                image_base,
+                export_opts.layout,
+                export_opts.shard_align,
+                false,
+            )?;
+            let mut db = if export_opts.layout.writes_turso() {
+                let mut w =
+                    ProjectDbWriter::create(&out_dir.join(DB_FILE), image_base, export_opts.shard_align)?;
+                w.write_program_metadata(&file_name, &path_label, &prog, export_opts)?;
+                Some(w)
+            } else {
+                None
+            };
+            for r in &results {
+                let rva = rva_of(r.address, image_base);
+                let end_rva = rva.saturating_add(u64::try_from(r.size).unwrap_or(0));
+                let block = render_c(std::slice::from_ref(r));
+                let receipt = shard_writer.write_func(rva, end_rva, &block)?;
+                if let Some(db) = db.as_mut() {
+                    db.insert_function(r, Some(&receipt.rel_path))?;
+                }
+                spans.push(WrittenSpan {
+                    c_file: Some(receipt.rel_path),
+                    span: Some((receipt.offset, receipt.len)),
+                });
+            }
+            let summary = shard_writer.finalize()?;
+            total_c_bytes = summary.total_bytes;
+            sizes.push((format!("{} shards", summary.shard_count), summary.total_bytes as usize));
+            sizes.push((SHARDS_MANIFEST.to_string(), summary.shards_json_bytes));
+            if let Some(mut db) = db {
+                db.write_types_and_globals(&types, &results)?;
+                let db_bytes = db.finalize()?;
+                sizes.push((DB_FILE.to_string(), db_bytes as usize));
+            }
+        }
+        OutputLayout::Turso => {
+            let mut db =
+                ProjectDbWriter::create(&out_dir.join(DB_FILE), image_base, export_opts.shard_align)?;
+            db.write_program_metadata(&file_name, &path_label, &prog, export_opts)?;
+            for r in &results {
+                db.insert_function(r, None)?;
+                spans.push(WrittenSpan { c_file: None, span: None });
+            }
+            db.write_types_and_globals(&types, &results)?;
+            let db_bytes = db.finalize()?;
+            sizes.push((DB_FILE.to_string(), db_bytes as usize));
+        }
     }
+
+    let h_name = format!("{file_name}.h");
+    let h_path = out_dir.join(&h_name);
+    std::fs::write(&h_path, &header)
+        .map_err(|e| format!("cannot write {}: {e}", h_path.display()))?;
+    sizes.push((h_name, header.len()));
+
+    if let Some(asm_text) = &asm {
+        let asm_name = format!("{file_name}.asm");
+        let asm_path = out_dir.join(&asm_name);
+        std::fs::write(&asm_path, asm_text)
+            .map_err(|e| format!("cannot write {}: {e}", asm_path.display()))?;
+        sizes.push((asm_name, asm_text.len()));
+    }
+
+    let readme_path = out_dir.join("README.md");
+    std::fs::write(&readme_path, &readme)
+        .map_err(|e| format!("cannot write {}: {e}", readme_path.display()))?;
+    sizes.push(("README.md".to_string(), readme.len()));
+
     if let Some(watch) = watch {
-        sizes.extend(watch.written(&out_dir, &file_name, &results)?);
+        sizes.extend(watch.written(&out_dir, image_base, &results, &spans, total_c_bytes)?);
     }
 
     let ok = results.iter().filter(|r| r.error.is_none()).count();

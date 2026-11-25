@@ -124,6 +124,7 @@ fn every_json_surface_names_its_root_in_help() {
         ("unpack", "{binary,"),
         ("test", "{unit_footer,"),
         ("modes", "{modes:["),
+        ("query", "{db,"),
         ("docs", "[{topic,"),
         ("catalog", "[{option,"),
     ];

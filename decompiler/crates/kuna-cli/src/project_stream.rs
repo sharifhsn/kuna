@@ -44,9 +44,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use kuna_console::engine::{ConsoleProgram, EntrySelector, FunctionEntry};
 use kuna_console::project::{
-    build_header_with_names, collect_dat_addrs, decompile_pulled, render_c, render_readme,
-    render_readme_streaming, deferred_callwide_header, validate_callwide_header, AsmPhase, BatchOutcome, DecompileOptions, FuncResult, ReadmeCounts,
-    GlobalAliasNames, ReadmeFacts, ReadmeLayout, StreamPhase, StreamProgress,
+    build_header_with_names, collect_dat_addrs, decompile_pulled, deferred_callwide_header,
+    render_c, render_readme, render_readme_streaming, rva_of, validate_callwide_header, AsmPhase,
+    BatchOutcome, DecompileOptions, FuncResult, GlobalAliasNames, ReadmeCounts, ReadmeFacts,
+    ReadmeLayout, StreamPhase, StreamProgress,
 };
 use kuna_console::project_stream::{
     asm_labels_from_entries, render_data_tail, render_variables_section, AsmSweep,
@@ -59,6 +60,10 @@ use crate::decompile_all::{
 };
 use crate::jobs::{self, ChunkSource, TargetSpec};
 use crate::jsonfmt::{dumps_compact, Json};
+use crate::project_db::{ProjectDbWriter, DB_FILE};
+use crate::project_shards::{
+    OutputLayout, ProjectExportOpts, ShardSummary, ShardWriter, SHARDS_MANIFEST,
+};
 
 /// The status file, present only while an export is running.
 const STATUS_FILE: &str = ".streaming";
@@ -609,7 +614,11 @@ struct ProjectWriter {
     dir: PathBuf,
     file_name: String,
     prelude: String,
-    c: File,
+    image_base: u64,
+    export_opts: ProjectExportOpts,
+    c: Option<File>,
+    shards: Option<ShardWriter>,
+    db: Option<ProjectDbWriter>,
     index: File,
     c_bytes: u64,
     seq: usize,
@@ -636,20 +645,49 @@ impl ProjectWriter {
     /// Truncate and create the streamed artifacts.  Called only once the load,
     /// the language check and the target set have all succeeded — before that a
     /// previous export's artifacts are still the best answer in the folder.
-    fn create(layout: &Layout, prelude: String, selected_entries: BTreeSet<u64>) -> Result<Self, String> {
+    fn create(
+        layout: &Layout,
+        prelude: String,
+        selected_entries: BTreeSet<u64>,
+        image_base: u64,
+        export_opts: ProjectExportOpts,
+        db: Option<ProjectDbWriter>,
+    ) -> Result<Self, String> {
         let dir = layout.out_dir.clone();
         let file_name = layout.file_name.clone();
-        let mut c = create(&dir.join(format!("{file_name}.c")))?;
-        c.write_all(format!("#include \"{file_name}.h\"\n\n").as_bytes())
-            .map_err(|e| format!("cannot write {file_name}.c: {e}"))?;
-        let c_bytes = format!("#include \"{file_name}.h\"\n\n").len() as u64;
+        let (c, c_bytes) = if export_opts.layout.writes_single_c() {
+            let mut c_file = create(&dir.join(format!("{file_name}.c")))?;
+            let header = format!("#include \"{file_name}.h\"\n\n");
+            c_file
+                .write_all(header.as_bytes())
+                .map_err(|e| format!("cannot write {file_name}.c: {e}"))?;
+            (Some(c_file), header.len() as u64)
+        } else {
+            (None, 0)
+        };
+        let shards = if export_opts.layout.writes_shards() {
+            Some(ShardWriter::new(
+                &dir,
+                &file_name,
+                image_base,
+                export_opts.layout,
+                export_opts.shard_align,
+                true,
+            )?)
+        } else {
+            None
+        };
         let index = create(&dir.join(INDEX_FILE))?;
         let now = Instant::now();
         let writer = Self {
             dir,
             file_name,
             prelude,
+            image_base,
+            export_opts,
             c,
+            shards,
+            db,
             index,
             c_bytes,
             seq: 0,
@@ -712,13 +750,31 @@ impl ProjectWriter {
 
     fn publish(&mut self, mut r: FuncResult, run: &StreamRun) -> Result<(), String> {
         let block = render_c(std::slice::from_ref(&r));
-        self.c
-            .write_all(block.as_bytes())
-            .map_err(|e| format!("cannot append to {}.c: {e}", self.file_name))?;
-        let offset = self.c_bytes;
-        self.c_bytes += block.len() as u64;
-        self.dat.extend(collect_dat_addrs(std::slice::from_ref(&r)));
-        let line = index_line(self.seq, &r, Some((offset, block.len())));
+        let rva = rva_of(r.address, self.image_base);
+        let end_rva = rva.saturating_add(u64::try_from(r.size).unwrap_or(0));
+
+        let (c_file, span) = if let Some(c) = self.c.as_mut() {
+            c.write_all(block.as_bytes())
+                .map_err(|e| format!("cannot append to {}.c: {e}", self.file_name))?;
+            let offset = self.c_bytes;
+            self.c_bytes += block.len() as u64;
+            (Some(format!("{}.c", self.file_name)), Some((offset, block.len())))
+        } else if let Some(shards) = self.shards.as_mut() {
+            let receipt = shards.write_func(rva, end_rva, &block)?;
+            self.c_bytes = shards.total_bytes();
+            (Some(receipt.rel_path), Some((receipt.offset, receipt.len)))
+        } else {
+            (None, None)
+        };
+
+        if let Some(db) = self.db.as_mut() {
+            db.insert_function(&r, c_file.as_deref())?;
+        }
+
+        if !self.export_opts.no_asm {
+            self.dat.extend(collect_dat_addrs(std::slice::from_ref(&r)));
+        }
+        let line = index_line(self.seq, &r, self.image_base, c_file.as_deref(), span);
         self.index
             .write_all(line.as_bytes())
             .map_err(|e| format!("cannot append to {INDEX_FILE}: {e}"))?;
@@ -746,6 +802,21 @@ impl ProjectWriter {
         shared.status.c_bytes = self.c_bytes;
         shared.status.last_result = Instant::now();
         Ok(())
+    }
+
+    fn finalize_outputs(&mut self, types: &str) -> Result<(Option<ShardSummary>, Option<u64>), String> {
+        let shard_summary = match self.shards.take() {
+            Some(shards) => Some(shards.finalize()?),
+            None => None,
+        };
+        let db_bytes = match self.db.take() {
+            Some(mut db) => {
+                db.write_types_and_globals(types, &self.records)?;
+                Some(db.finalize()?)
+            }
+            None => None,
+        };
+        Ok((shard_summary, db_bytes))
     }
 
     /// The clock-driven half — driven by TIME, not by results, so a run whose
@@ -789,10 +860,19 @@ fn create(path: &Path) -> Result<File, String> {
     File::create(path).map_err(|e| format!("cannot create {}: {e}", path.display()))
 }
 
-/// One `index.jsonl` line: what the function is, and the exact span of the `.c`
-/// its block occupies — `null` in a feed line written before the `.c` exists.
-fn index_line(seq: usize, r: &FuncResult, span: Option<(u64, usize)>) -> String {
+/// One `index.jsonl` line: what the function is, its RVA coordinates, and the
+/// exact span of the `.c` file its block occupies — `null` in a feed line
+/// written before the `.c` exists or in `turso`-only layout.
+fn index_line(
+    seq: usize,
+    r: &FuncResult,
+    image_base: u64,
+    c_file: Option<&str>,
+    span: Option<(u64, usize)>,
+) -> String {
     let num = |v: u64| Json::Number(v.to_string());
+    let rva = rva_of(r.address, image_base);
+    let end_rva = rva.saturating_add(u64::try_from(r.size).unwrap_or(0));
     let (offset, len) = match span {
         Some((offset, len)) => (num(offset), num(len as u64)),
         None => (Json::Null, Json::Null),
@@ -801,7 +881,10 @@ fn index_line(seq: usize, r: &FuncResult, span: Option<(u64, usize)>) -> String 
         ("seq".into(), num(seq as u64)),
         ("name".into(), Json::Str(r.name.clone())),
         ("addr".into(), Json::Str(format!("0x{:x}", r.address))),
+        ("rva".into(), Json::Str(format!("0x{rva:x}"))),
+        ("end_rva".into(), Json::Str(format!("0x{end_rva:x}"))),
         ("size".into(), Json::Number(r.size.to_string())),
+        ("c_file".into(), c_file.map_or(Json::Null, |f| Json::Str(f.to_string()))),
         ("c_offset".into(), offset),
         ("c_len".into(), len),
         ("error".into(), r.error.clone().map_or(Json::Null, Json::Str)),
@@ -816,6 +899,7 @@ pub(crate) fn run(
     args: &Args,
     output: Option<&str>,
     mode: StreamMode,
+    export_opts: ProjectExportOpts,
 ) -> Result<crate::decompile_project::ProjectCompletion, String> {
     let layout = Layout::resolve(args, output)?;
     refuse_a_live_export(&layout.out_dir)?;
@@ -836,8 +920,8 @@ pub(crate) fn run(
     // at all, and there is no next tick to retry them on yet.
     let opened = run.publish_status().and_then(|()| run.publish_readme());
     let exported = opened.and_then(|()| match mode {
-        StreamMode::Stream => export(args, &layout, &run),
-        StreamMode::Progress => progress::export(args, output, &layout, &run),
+        StreamMode::Stream => export(args, &layout, &run, export_opts),
+        StreamMode::Progress => progress::export(args, output, &layout, &run, export_opts),
     });
     match exported {
         Ok(summary) => Ok(summary),
@@ -861,6 +945,7 @@ fn export(
     args: &Args,
     layout: &Layout,
     run: &StreamRun,
+    export_opts: ProjectExportOpts,
 ) -> Result<crate::decompile_project::ProjectCompletion, String> {
     let load_started = Instant::now();
     let mut prog = load_with_heartbeat(args, run)?;
@@ -899,23 +984,48 @@ fn export(
     scheduler.seed(&seeds);
 
     let prelude = print_c_recompile_prelude(prog.arch());
-    let mut sweep =
-        AsmSweep::new(&prog, &layout.file_name, asm_labels_from_entries(&prog, &targets));
-    // An image with no CODE section has nothing to sweep, so its `.asm` is final
-    // before the first function is decompiled: `pending` means the sweep has not
-    // started, and an agent waiting for `complete` must not wait for the export.
-    if sweep.is_done() {
+    let image_base = prog.image_base();
+    let mut sweep = if export_opts.no_asm {
+        None
+    } else {
+        Some(AsmSweep::new(&prog, &layout.file_name, asm_labels_from_entries(&prog, &targets)))
+    };
+    // An image with no CODE section (or `--no-asm`) has nothing to sweep.
+    if sweep.as_ref().is_none_or(AsmSweep::is_done) {
         run.set_asm_phase(AsmPhase::Complete);
     }
     // From here the folder is this run's: everything below truncates.
     run.artifacts.store(true, Ordering::SeqCst);
-    let mut asm = BufWriter::new(create(&layout.out_dir.join(format!("{}.asm", layout.file_name)))?);
-    asm.write_all(sweep.header_lines().as_bytes())
-        .map_err(|e| format!("cannot write {}.asm: {e}", layout.file_name))?;
+    let mut asm = if let Some(sw) = sweep.as_ref() {
+        let mut f = BufWriter::new(create(&layout.out_dir.join(format!("{}.asm", layout.file_name)))?);
+        f.write_all(sw.header_lines().as_bytes())
+            .map_err(|e| format!("cannot write {}.asm: {e}", layout.file_name))?;
+        Some(f)
+    } else {
+        None
+    };
+    let db = if export_opts.layout.writes_turso() {
+        let mut w = ProjectDbWriter::create(
+            &layout.out_dir.join(DB_FILE),
+            image_base,
+            export_opts.shard_align,
+        )?;
+        w.write_program_metadata(&layout.file_name, &layout.path_label, &prog, export_opts)?;
+        Some(w)
+    } else {
+        None
+    };
     let selected_entries = if prog.arch().call_wide && specs.len() <= CALLWIDE_PENDING_RECORDS {
         specs.iter().map(|spec| spec.addr).collect()
     } else { BTreeSet::new() };
-    let writer = ProjectWriter::create(layout, prelude.clone(), selected_entries)?;
+    let writer = ProjectWriter::create(
+        layout,
+        prelude.clone(),
+        selected_entries,
+        image_base,
+        export_opts,
+        db,
+    )?;
     {
         let mut shared = run.lock();
         shared.facts = ReadmeFacts::snapshot(
@@ -955,14 +1065,30 @@ fn export(
             let writing = scope.spawn(move || writer_loop(writer, rx, run));
             let produced = if args.jobs > 1 {
                 let pooled = run_pooled(
-                    args, layout, &prog, &specs, &scheduler, &tx, load_seconds, &mut sweep,
-                    &mut asm, run, scope,
+                    args,
+                    layout,
+                    &prog,
+                    &specs,
+                    &scheduler,
+                    &tx,
+                    load_seconds,
+                    sweep.as_mut(),
+                    asm.as_mut(),
+                    run,
+                    scope,
                 );
                 drop(tx);
                 pooled
             } else {
                 let serial = run_serial(
-                    &mut prog, &targets, &scheduler, &opts, &tx, &mut sweep, &mut asm, run,
+                    &mut prog,
+                    &targets,
+                    &scheduler,
+                    &opts,
+                    &tx,
+                    sweep.as_mut(),
+                    asm.as_mut(),
+                    run,
                 );
                 drop(tx);
                 serial.map(|()| (Vec::new(), jobs::Retries::default()))
@@ -997,10 +1123,13 @@ fn export(
     type_blocks.push(print_c_types(prog.arch_mut()));
     let types = jobs::merge_type_definitions(&type_blocks, jobs::STREAM_TAG);
     writer.write_header(Some(&types))?;
-    asm.write_all(render_variables_section(&writer.records).as_bytes())
-        .and_then(|()| asm.write_all(render_data_tail(&prog, &writer.dat).as_bytes()))
-        .and_then(|()| asm.flush())
-        .map_err(|e| format!("cannot write {}.asm: {e}", layout.file_name))?;
+    let (shard_summary, db_bytes) = writer.finalize_outputs(&types)?;
+    if let Some(asm) = asm.as_mut() {
+        asm.write_all(render_variables_section(&writer.records).as_bytes())
+            .and_then(|()| asm.write_all(render_data_tail(&prog, &writer.dat).as_bytes()))
+            .and_then(|()| asm.flush())
+            .map_err(|e| format!("cannot write {}.asm: {e}", layout.file_name))?;
+    }
 
     let counts = ReadmeCounts::of(&writer.records);
     let facts = run.lock().facts.clone();
@@ -1014,20 +1143,30 @@ fn export(
     std::fs::remove_file(&status)
         .map_err(|e| format!("cannot remove {}: {e}", status.display()))?;
 
-    let files = [
-        format!("{}.c", layout.file_name),
-        format!("{}.h", layout.file_name),
-        format!("{}.asm", layout.file_name),
-        README_FILE.to_string(),
-        INDEX_FILE.to_string(),
-    ]
-    .iter()
-    .map(|name| {
-        let size = std::fs::metadata(layout.out_dir.join(name)).map(|m| m.len()).unwrap_or(0);
-        format!("{name} ({size} bytes)")
-    })
-    .collect::<Vec<_>>()
-    .join(", ");
+    let mut summary_items: Vec<String> = Vec::new();
+    if export_opts.layout == OutputLayout::Single {
+        let name = format!("{}.c", layout.file_name);
+        let size = std::fs::metadata(layout.out_dir.join(&name)).map(|m| m.len()).unwrap_or(0);
+        summary_items.push(format!("{name} ({size} bytes)"));
+    }
+    if let Some(s) = shard_summary {
+        summary_items.push(format!("{} shards ({} bytes)", s.shard_count, s.total_bytes));
+        summary_items.push(format!("{SHARDS_MANIFEST} ({} bytes)", s.shards_json_bytes));
+    }
+    if let Some(db_size) = db_bytes {
+        summary_items.push(format!("{DB_FILE} ({db_size} bytes)"));
+    }
+    let mut static_names = vec![format!("{}.h", layout.file_name)];
+    if !export_opts.no_asm {
+        static_names.push(format!("{}.asm", layout.file_name));
+    }
+    static_names.push(README_FILE.to_string());
+    static_names.push(INDEX_FILE.to_string());
+    for name in static_names {
+        let size = std::fs::metadata(layout.out_dir.join(&name)).map(|m| m.len()).unwrap_or(0);
+        summary_items.push(format!("{name} ({size} bytes)"));
+    }
+    let files = summary_items.join(", ");
     Ok(crate::decompile_project::ProjectCompletion {
         summary: format!(
             "wrote {}: {files}; functions: {} ok, {} failed\n",
@@ -1175,8 +1314,8 @@ fn run_pooled<'scope, 'env>(
     scheduler: &'env Scheduler,
     tx: &mpsc::Sender<Vec<FuncResult>>,
     load_seconds: f64,
-    sweep: &mut AsmSweep,
-    asm: &mut BufWriter<File>,
+    sweep: Option<&mut AsmSweep>,
+    asm: Option<&mut BufWriter<File>>,
     run: &'env StreamRun,
     scope: &'scope std::thread::Scope<'scope, 'env>,
 ) -> Result<(Vec<String>, jobs::Retries), String> {
@@ -1208,7 +1347,10 @@ fn run_pooled<'scope, 'env>(
         )
     });
 
-    let swept = sweep_to_end(prog, sweep, asm, run);
+    let swept = match (sweep, asm) {
+        (Some(sw), Some(out)) => sweep_to_end(prog, sw, out, run),
+        _ => Ok(()),
+    };
     let pooled = pool.join().map_err(|_| "the --stream worker pool panicked".to_string())?;
     swept.map_err(|e| format!("cannot write {}.asm: {e}", layout.file_name))?;
     pooled
@@ -1224,12 +1366,12 @@ fn run_serial(
     scheduler: &Scheduler,
     opts: &DecompileOptions,
     tx: &mpsc::Sender<Vec<FuncResult>>,
-    sweep: &mut AsmSweep,
-    asm: &mut BufWriter<File>,
+    mut sweep: Option<&mut AsmSweep>,
+    mut asm: Option<&mut BufWriter<File>>,
     run: &StreamRun,
 ) -> Result<(), String> {
     let step = (code_bytes(prog) / SWEEP_STEPS).max(MIN_SWEEP_STEP_BYTES);
-    if sweep.is_done() {
+    if sweep.as_deref().is_none_or(AsmSweep::is_done) {
         run.set_asm_phase(AsmPhase::Complete);
     }
     // (kuna `elemptr`) Each body is written as it lands, so nothing can decide
@@ -1237,10 +1379,8 @@ fn run_serial(
     kuna_decomp::kuna_elemptr::without_objects(prog.arch_mut());
     let mut batch = 1usize;
     loop {
-        // The callee-hint context is built once per `decompile_pulled` call, so
-        // the interleave is batched rather than per function, and once the sweep
-        // is out of the way the rest of the run is ONE call.
-        let limit = if sweep.is_done() { usize::MAX } else { batch };
+        let sweep_done = sweep.as_deref().is_none_or(AsmSweep::is_done);
+        let limit = if sweep_done { usize::MAX } else { batch };
         let mut taken = 0usize;
         decompile_pulled(
             prog,
@@ -1264,17 +1404,18 @@ fn run_serial(
         if run.abort.stopped() {
             return Err(run.abort.reason());
         }
-        if !sweep.is_done() {
-            run.set_asm_phase(AsmPhase::Sweeping);
-            sweep
-                .step(prog, step, asm)
-                .and_then(|_| asm.flush())
-                .map_err(|e| format!("cannot write the disassembly: {e}"))?;
-            if sweep.is_done() {
-                run.set_asm_phase(AsmPhase::Complete);
+        if let (Some(sw), Some(out)) = (sweep.as_deref_mut(), asm.as_deref_mut()) {
+            if !sw.is_done() {
+                run.set_asm_phase(AsmPhase::Sweeping);
+                sw.step(prog, step, out)
+                    .and_then(|_| out.flush())
+                    .map_err(|e| format!("cannot write the disassembly: {e}"))?;
+                if sw.is_done() {
+                    run.set_asm_phase(AsmPhase::Complete);
+                }
             }
         }
-        if taken == 0 && sweep.is_done() {
+        if taken == 0 && sweep.as_deref().is_none_or(AsmSweep::is_done) {
             return Ok(());
         }
         if taken > 0 {
@@ -1390,7 +1531,7 @@ mod tests {
                 if reverse { records.reverse(); }
                 let expected = kuna_console::project::build_header("image", "", "", &records).unwrap();
                 let run = StreamRun::new(dir.clone(), ReadmeLayout::Streamed, ReadmeFacts::default(), 1);
-                let mut writer = ProjectWriter::create(&layout, String::new(), BTreeSet::new()).unwrap();
+                let mut writer = ProjectWriter::create(&layout, String::new(), BTreeSet::new(), 0, ProjectExportOpts::default(), None).unwrap();
                 for record in records { writer.append(record, &run).unwrap(); }
                 assert!(writer.records.iter().all(|r| r.code.is_none()));
                 writer.write_header(Some("")).unwrap();
@@ -1412,7 +1553,7 @@ mod tests {
             file_name: "image".into(), out_dir: dir.clone(),
         };
         let run = StreamRun::new(dir.clone(), ReadmeLayout::Streamed, ReadmeFacts::default(), 1);
-        let mut writer = ProjectWriter::create(&layout, String::new(), BTreeSet::new()).unwrap();
+        let mut writer = ProjectWriter::create(&layout, String::new(), BTreeSet::new(), 0, ProjectExportOpts::default(), None).unwrap();
         let mut first = result(0x1000, Vec::new());
         first.call_declarations = vec!["unsigned long long producer(int);".into()];
         first.callwide_prototypes = vec![kuna_decomp::kuna_callwide::ExportPrototype {
@@ -1471,7 +1612,7 @@ mod tests {
             let run = StreamRun::new(dir.clone(), ReadmeLayout::Streamed, ReadmeFacts::default(), 1);
             let records = wide_records();
             let selected = records.iter().map(|r| r.byte_address).collect();
-            let mut writer = ProjectWriter::create(&layout, String::new(), selected).unwrap();
+            let mut writer = ProjectWriter::create(&layout, String::new(), selected, 0, ProjectExportOpts::default(), None).unwrap();
             for index in order {
                 let before = std::fs::read(dir.join(INDEX_FILE)).unwrap();
                 writer.append(records[index].clone(), &run).unwrap();
@@ -1510,7 +1651,7 @@ mod tests {
             let run = StreamRun::new(dir.clone(), ReadmeLayout::Streamed, ReadmeFacts::default(), 1);
             let [caller, other, mut producer] = wide_records();
             let selected = [caller.byte_address, other.byte_address, producer.byte_address].into_iter().collect();
-            let mut writer = ProjectWriter::create(&layout, String::new(), selected).unwrap();
+            let mut writer = ProjectWriter::create(&layout, String::new(), selected, 0, ProjectExportOpts::default(), None).unwrap();
             writer.append(caller, &run).unwrap();
             let c = std::fs::read(dir.join("image.c")).unwrap();
             let index = std::fs::read(dir.join(INDEX_FILE)).unwrap();
@@ -1584,7 +1725,7 @@ mod tests {
         };
         let prelude = print_c_recompile_prelude(prog.arch());
         let run = StreamRun::new(dir.clone(), ReadmeLayout::Streamed, ReadmeFacts::default(), 1);
-        let mut writer = ProjectWriter::create(&layout, prelude, selected).unwrap();
+        let mut writer = ProjectWriter::create(&layout, prelude, selected, 0, ProjectExportOpts::default(), None).unwrap();
         let expected = render_c(&records);
         for (index, record) in records.into_iter().enumerate() {
             let before = std::fs::read(dir.join(INDEX_FILE)).unwrap();
@@ -1872,10 +2013,13 @@ mod tests {
         let prelude = "#include \"x.h\"\n\n";
         let c = format!("{prelude}{block}");
         let offset = prelude.len();
-        let line = index_line(0, &ok, Some((offset as u64, block.len())));
+        let line = index_line(0, &ok, 0x400000, Some("x.c"), Some((offset as u64, block.len())));
         assert!(line.ends_with('\n'));
         assert!(line.contains("\"seq\":0"));
         assert!(line.contains("\"addr\":\"0x401000\""));
+        assert!(line.contains("\"rva\":\"0x1000\""));
+        assert!(line.contains("\"end_rva\":\"0x1020\""));
+        assert!(line.contains("\"c_file\":\"x.c\""));
         assert!(line.contains("\"error\":null"));
         assert!(line.contains(&format!("\"c_offset\":{offset}")));
         assert_eq!(&c[offset..offset + block.len()], block);
@@ -1883,9 +2027,9 @@ mod tests {
         let mut bad = ok;
         bad.code = None;
         bad.error = Some("budget exceeded".into());
-        assert!(index_line(1, &bad, Some((0, 0))).contains("\"error\":\"budget exceeded\""));
+        assert!(index_line(1, &bad, 0x400000, Some("x.c"), Some((0, 0))).contains("\"error\":\"budget exceeded\""));
 
-        let feed = index_line(2, &bad, None);
+        let feed = index_line(2, &bad, 0x400000, Some("x.c"), None);
         assert!(feed.contains("\"c_offset\":null,\"c_len\":null"), "{feed}");
     }
 }

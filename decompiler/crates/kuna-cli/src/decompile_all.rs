@@ -962,6 +962,37 @@ pub(crate) fn decompile_targets_pooled(
     arm_frames: Option<String>,
     watch: Option<&dyn jobs::PoolWatch>,
 ) -> Result<jobs::PoolOutput, String> {
+    decompile_targets_pooled_with_hints(
+        args,
+        targets,
+        inventory,
+        want_proto,
+        want_provenance,
+        want_types,
+        false,
+        load_seconds,
+        synth_base,
+        serial_callee_first,
+        arm_frames,
+        watch,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decompile_targets_pooled_with_hints(
+    args: &Args,
+    targets: &[FunctionEntry],
+    inventory: &[FunctionEntry],
+    want_proto: bool,
+    want_provenance: bool,
+    want_types: bool,
+    want_callee_hints: bool,
+    load_seconds: f64,
+    synth_base: Option<shard::Replay>,
+    serial_callee_first: bool,
+    arm_frames: Option<String>,
+    watch: Option<&dyn jobs::PoolWatch>,
+) -> Result<jobs::PoolOutput, String> {
     let specs = flatten_targets(targets);
     let inventory = flatten_targets(inventory);
     let mut cfg = pool_config(
@@ -969,7 +1000,7 @@ pub(crate) fn decompile_targets_pooled(
         want_proto,
         want_provenance,
         want_types,
-        /* want_callee_hints= */ false,
+        want_callee_hints,
         load_seconds,
     );
     cfg.synth_base = synth_base;

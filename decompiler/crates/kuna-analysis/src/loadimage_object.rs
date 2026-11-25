@@ -565,6 +565,9 @@ pub struct ObjectLoadImage {
     /// The container's declared entry as a code address (the Thumb bit folded
     /// on ARM), `None` for a relocatable object or an image that declares none.
     image_entry: Option<u64>,
+    /// The container's preferred load base (`ImageBase` on PE, lowest `PT_LOAD`
+    /// on ELF, `__TEXT` vmaddr on Mach-O, synthetic layout base on relocatables).
+    image_base: Option<u64>,
     /// (kuna) The loadable segments as mapping *metadata*, ascending by vma —
     /// the same `(vma, size, flags)` shape as [`Self::sections`], reported by
     /// `getSegments` so a section-keyed reader has a container to fall back on
@@ -1230,6 +1233,24 @@ impl ObjectLoadImage {
         let dynreloc_const: Vec<(u64, u64)> =
             dynrelocs.const_ranges.into_iter().filter(|(lo, _)| applied.contains(lo)).collect();
 
+        let rel_base = file.relative_address_base();
+        let image_base = if rel_base != 0 {
+            Some(rel_base)
+        } else {
+            segments
+                .iter()
+                .map(|s| s.vma)
+                .min()
+                .or_else(|| {
+                    segment_info
+                        .iter()
+                        .filter(|s| !inaccessible_segments.iter().any(|&(v, _)| v == s.vma))
+                        .map(|s| s.vma)
+                        .min()
+                })
+                .or(Some(0))
+        };
+
         Ok(ObjectLoadImage {
             runtime_code_relocation: runtime_code_relocation(&file),
             filename: filename.to_string(),
@@ -1244,6 +1265,7 @@ impl ObjectLoadImage {
             sections,
             section_metadata,
             image_entry,
+            image_base,
             segment_info,
             executable_segments,
             inaccessible_segments,
@@ -1415,6 +1437,12 @@ impl ObjectLoadImage {
             }
         }
 
+        let reloc_image_base = section_metadata
+            .iter()
+            .map(|s| s.vma)
+            .min()
+            .unwrap_or(reloc_object::RELOC_BASE);
+
         Ok(ObjectLoadImage {
             runtime_code_relocation: true,
             filename: filename.to_string(),
@@ -1430,6 +1458,7 @@ impl ObjectLoadImage {
             section_metadata,
             // A pre-link object declares no entry.
             image_entry: None,
+            image_base: Some(reloc_image_base),
             // No program headers on a relocatable object: the section table is
             // the only mapping story it has, and it always has one.
             segment_info: Vec::new(),
@@ -1510,6 +1539,11 @@ impl ObjectLoadImage {
     /// The container's declared entry as a code address, if it declares one.
     pub fn image_entry(&self) -> Option<u64> {
         self.image_entry
+    }
+
+    /// The container's preferred image base address, used for RVA computation.
+    pub fn image_base(&self) -> Option<u64> {
+        self.image_base
     }
 
     /// The validated PowerPC64 ELFv1 function descriptors; empty for every other image.

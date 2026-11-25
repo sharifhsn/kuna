@@ -23,6 +23,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 sha2 = "0.11"
 tempfile = "3.27"
+# why: pure-Rust SQLite-compatible embedded database for address-keyed project exports
+turso = { version = "0.8", default-features = false }
+# why: single-threaded runtime for embedded Turso async API
+tokio = { version = "1", default-features = false, features = ["rt"] }
 
 [features]
 # Carry the compiled SLEIGH tree inside the binary (build.rs reads `specs/`, so
