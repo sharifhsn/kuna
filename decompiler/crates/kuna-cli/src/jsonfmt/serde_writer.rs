@@ -22,16 +22,20 @@ impl Formatter for AsciiPretty {
         writer: &mut W,
         fragment: &str,
     ) -> io::Result<()> {
+        let bytes = fragment.as_bytes();
+        if bytes.is_ascii() && !bytes.contains(&0x7f) {
+            return writer.write_all(bytes);
+        }
         let mut start = 0;
         for (offset, ch) in fragment.char_indices() {
             if ch < '\u{7f}' {
                 continue;
             }
-            writer.write_all(&fragment.as_bytes()[start..offset])?;
+            writer.write_all(&bytes[start..offset])?;
             write!(writer, "{}", UnicodeEscape(ch))?;
             start = offset + ch.len_utf8();
         }
-        writer.write_all(&fragment.as_bytes()[start..])
+        writer.write_all(&bytes[start..])
     }
 
     fn begin_array<W: ?Sized + Write>(&mut self, writer: &mut W) -> io::Result<()> {

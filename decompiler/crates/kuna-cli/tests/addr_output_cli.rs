@@ -174,7 +174,7 @@ fn helper_query_preserves_text_and_ascii_json() {
         "pdb_demo_compute", "--layout", "turso", "--no-asm", "--sleighpath", &specs(),
     ]);
     assert!(export.status.success(), "{}", String::from_utf8_lossy(&export.stderr));
-    let body = "first line\nsecond \"é🙂\"\t";
+    let body = "first\x7f line\nsecond \"é🙂\"\t";
     tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(async {
         let path = temp.path().join("functions.db");
         let db = turso::Builder::new_local(path.to_str().unwrap()).build().await.unwrap();
@@ -194,6 +194,7 @@ fn helper_query_preserves_text_and_ascii_json() {
     assert!(pretty.status.success());
     let text = String::from_utf8(pretty.stdout).unwrap();
     assert!(text.is_ascii());
+    assert!(text.contains(r"first\u007f line"));
     assert!(text.contains(r#"\u00e9\ud83d\ude42"#) && text.ends_with("}\n"));
     let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(doc["functions"], serde_json::json!([]));
@@ -201,6 +202,40 @@ fn helper_query_preserves_text_and_ascii_json() {
         "id": "sample", "name": "example", "module": "test", "head_rva": null,
         "proto": null, "body": body, "site_count": 1
     }]));
+}
+
+#[test]
+fn text_query_validates_shadowed_prototypes_before_output() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().to_str().unwrap();
+    let export = run_kuna(&[
+        "decompile-project", &fixture("pdb_prog.exe"), "-o", dir, "--functions",
+        "pdb_demo_compute", "--layout", "turso", "--no-asm", "--sleighpath", &specs(),
+    ]);
+    assert!(export.status.success(), "{}", String::from_utf8_lossy(&export.stderr));
+    tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(async {
+        let path = temp.path().join("functions.db");
+        let db = turso::Builder::new_local(path.to_str().unwrap()).build().await.unwrap();
+        db.connect().unwrap().execute(
+            "INSERT INTO functions (rva,va,end_rva,shard_rva,name,size,proto,code) VALUES
+             (1,1,2,0,'one',1,'int one(void);','return 1;'),
+             (2,2,3,0,'two',1,x'78','return 2;')",
+            (),
+        ).await.unwrap();
+    });
+
+    let plain = run_kuna(&["query", dir, "--rva", "1"]);
+    assert!(plain.status.success());
+    assert_eq!(plain.stdout, b"// Function: one @ 0x1 (rva 0x1..0x2, size 1)\nreturn 1;\n\n");
+    let json = run_kuna(&["query", dir, "--rva", "1", "--json"]);
+    assert!(json.status.success());
+    let document: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(document["functions"][0]["proto"], "int one(void);");
+
+    let invalid = run_kuna(&["query", dir, "--range", "1..3"]);
+    assert_eq!(invalid.status.code(), Some(1));
+    assert!(invalid.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("expected nullable text column"));
 }
 
 #[test]

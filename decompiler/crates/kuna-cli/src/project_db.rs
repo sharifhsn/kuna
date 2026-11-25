@@ -611,6 +611,7 @@ pub struct ProjectDbReader {
     rt: tokio::runtime::Runtime,
     _db: Database,
     conn: Connection,
+    omit_shadowed_prototypes: bool,
 }
 
 impl ProjectDbReader {
@@ -631,7 +632,7 @@ impl ProjectDbReader {
                 .map_err(|e| format!("cannot connect {}: {e}", path.display()))?;
             Ok::<_, String>((db, conn))
         })?;
-        Ok(Self { rt, _db: db, conn })
+        Ok(Self { rt, _db: db, conn, omit_shadowed_prototypes: false })
     }
 
     pub fn summary(&self) -> Result<(BTreeMap<String, String>, DbCounts), String> {
@@ -664,7 +665,7 @@ impl ProjectDbReader {
     pub fn query_by_rva(&self, rva: u64) -> Result<Vec<QueriedFunction>, String> {
         self.rt.block_on(async {
             let mut exact = collect_functions(
-                &self.conn,
+                self,
                 &format!("SELECT {FUNCTION_COLUMNS} FROM functions WHERE rva = ?1"),
                 vec![Value::Integer(rva as i64)],
             )
@@ -680,7 +681,7 @@ impl ProjectDbReader {
                 "(rva >= 0 OR rva <= ?1) AND end_rva < 0 AND end_rva > ?1 ORDER BY (rva < 0) DESC, rva DESC"
             };
             exact = collect_functions(
-                &self.conn,
+                self,
                 &format!("SELECT {FUNCTION_COLUMNS} FROM functions WHERE {covering} LIMIT 1"),
                 vec![Value::Integer(rva as i64)],
             )
@@ -706,7 +707,7 @@ impl ProjectDbReader {
             "SELECT {FUNCTION_COLUMNS} FROM functions WHERE rva >= ?1 {join} rva {upper} ?2 ORDER BY {order}"
         );
         self.rt.block_on(collect_functions(
-            &self.conn,
+            self,
             &sql,
             vec![Value::Integer(start_rva as i64), Value::Integer(end_rva as i64)],
         ))
@@ -717,7 +718,7 @@ impl ProjectDbReader {
         let literal = pattern.replace('!', "!!").replace('_', "!_");
         let sql_pattern = if has_wild { literal.replace('*', "%") } else { format!("%{literal}%") };
         self.rt.block_on(collect_functions(
-            &self.conn,
+            self,
             &format!(
                 "SELECT {FUNCTION_COLUMNS} FROM functions WHERE name LIKE ?1 ESCAPE '!' \
                  ORDER BY CASE WHEN name = ?2 THEN 0 ELSE 1 END, (rva < 0), rva"
@@ -766,17 +767,17 @@ async fn count_table(conn: &Connection, table: &str) -> Result<i64, String> {
 }
 
 async fn collect_functions(
-    conn: &Connection,
+    reader: &ProjectDbReader,
     sql: &str,
     params: Vec<Value>,
 ) -> Result<Vec<QueriedFunction>, String> {
-    let mut rows = conn
+    let mut rows = reader.conn
         .query(sql, params)
         .await
         .map_err(|e| format!("query functions failed: {e}"))?;
     let mut out = Vec::new();
     while let Some(row) = rows.next().await.map_err(|e| format!("read function row: {e}"))? {
-        out.push(QueriedFunction {
+        let mut function = QueriedFunction {
             rva: val_i64(row.get_value(0))? as u64,
             va: val_i64(row.get_value(1))? as u64,
             end_rva: val_i64(row.get_value(2))? as u64,
@@ -787,7 +788,11 @@ async fn collect_functions(
             proto: val_opt_string(row.get_value(7))?,
             code: val_opt_string(row.get_value(8))?,
             error: val_opt_string(row.get_value(9))?,
-        });
+        };
+        if reader.omit_shadowed_prototypes && (function.code.is_some() || function.error.is_some()) {
+            function.proto = None;
+        }
+        out.push(function);
     }
     Ok(out)
 }
@@ -944,7 +949,7 @@ pub fn run_query(argv: &[String]) -> i32 {
         db_path = db_path.join(DB_FILE);
     }
 
-    let document = match QueryDocument::read(&db_path, rva, range, name.as_deref(), helpers) {
+    let document = match QueryDocument::read(&db_path, rva, range, name.as_deref(), helpers, json) {
         Ok(document) => document,
         Err(error) => {
             eprintln!("error: {error}");
@@ -978,8 +983,10 @@ impl QueryDocument {
         range: Option<(u64, u64, bool)>,
         name: Option<&str>,
         helpers: bool,
+        json: bool,
     ) -> Result<Self, String> {
-        let reader = ProjectDbReader::open(path)?;
+        let mut reader = ProjectDbReader::open(path)?;
+        reader.omit_shadowed_prototypes = !json;
         let (meta, counts) = reader.summary()?;
         let functions = if let Some(target) = rva {
             reader.query_by_rva(target)?
