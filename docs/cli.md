@@ -4201,6 +4201,46 @@ kuna decompile-project ./a.out --stream --jobs 12      # readable while it fills
 kuna decompile-project ./a.out --progress --jobs 12    # progress, artifacts at the end
 ```
 
+The `--layout` flag selects where the CLI writes function bodies.
+
+| Layout | Function bodies |
+|---|---|
+| `single` (default) | One `<name>.c` file |
+| `rva-slab` | One C file per occupied address bucket under `src/` |
+| `rva-file` | One C file per function under `funcs/`, grouped by address bucket |
+| `turso` | An embedded `functions.db` database |
+| `both` | Slab files and `functions.db` |
+
+RVA means relative virtual address, measured from the image base. `--shard-align`
+sets the bucket size to a positive power of two in bytes. Its default is 65536.
+File-based shard layouts write `shards.json` with the paths and occupied ranges.
+`--no-asm` skips the assembly listing. All layouts write the header and README.
+
+Each address-keyed layout writes `index.jsonl`, including on a serial export.
+Each row records the function's `rva`, exclusive `end_rva`, and aligned `shard`
+as hex strings. For file output, `c_file` is relative to the project folder,
+and `c_offset` and `c_len` identify the function's bytes within that file.
+Database-only rows have null file and byte-span fields. The single-file layout
+writes the index with `--stream` or `--progress` and uses a null `shard`.
+A progress feed acquires its final byte spans when the export finishes.
+
+Run `kuna query <project-dir> --json` for database metadata and row counts.
+Use `--name <pattern>`, `--rva <address>`, or `--range <start>..<end>` to select
+functions. Address comparisons use unsigned 64-bit order. A name matches a
+substring by default. `*` and `%` are wildcards and underscores are literal.
+The database file itself is also accepted as the first argument.
+
+With debug information, `kuna functions <binary> --json` includes an
+`inline_sites` array on functions with compiler-attributed inline calls.
+Each site records `source` (`pdb` or `dwarf`), a format-scoped hex `id`, the
+inlinee's `name`, its nesting `depth` and its `ranges` as half-open hex byte
+addresses. The outermost inline depth is zero.
+
+On PE inputs, `--pdb <path>` supplies a PDB for the loader and worker processes.
+A matching CodeView GUID and age are required by default. To explicitly accept
+a mismatch, add `--pdb-ignore-guid`. Use `--pdb=-symbols.pdb` for a path
+beginning with a hyphen.
+
 The project-export face of the same in-process core
 (`decompiler/crates/kuna-cli/src/decompile_project.rs`, a thin wrapper over the shared
 `kuna_console::project` module — the decompile loop + artifact builders also behind the
@@ -4395,7 +4435,9 @@ that function's `.c` block.
 |---|---|
 | `seq` | Zero-based, in write order. |
 | `name` / `addr` | The function and its display address as a `0x…` string — the two the block's `// Function:` header prints. |
-| `size` | The inventory extent in bytes, as a number; `0` when the extent is unknown. |
+| `size` | The inventory extent in bytes. A zero indicates an unknown extent. |
+| `rva` / `end_rva` / `shard` | Start, exclusive end, and aligned bucket, relative to the image base. The single-file layout has a null bucket. |
+| `c_file` | Path relative to the project folder, or null for database-only output. |
 | `c_offset` / `c_len` | The block's byte span in the `.c`: `c[c_offset..c_offset+c_len]` is exactly `// Function: …` through the block's trailing blank line. |
 | `error` | `null`, or this function's error string — the block is then the one-line `// Function: … (error: …)` comment form. |
 

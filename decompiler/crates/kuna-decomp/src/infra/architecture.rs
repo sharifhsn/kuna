@@ -76,6 +76,33 @@ use crate::userop::UserOpManage;
 // parser the frontend uses for the binaryimage — see decode_default_proto).
 // ---------------------------------------------------------------------------
 
+/// Mode for the PE-only MSVC RTTI and class recovery pass (`--option rtti`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum RttiMode {
+    #[default]
+    Off,
+    Names,
+    Classes,
+}
+
+impl RttiMode {
+    pub fn enabled(self) -> bool {
+        self != Self::Off
+    }
+
+    pub fn classes(self) -> bool {
+        self == Self::Classes
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Names => "names",
+            Self::Classes => "on",
+        }
+    }
+}
+
 /// First direct child element named `nm`, or `None`.
 fn find_child(el: &Rc<kuna_base::xml::Element>, nm: &str) -> Option<Rc<kuna_base::xml::Element>> {
     el.get_children().iter().find(|c| c.get_name() == nm).map(Rc::clone)
@@ -1872,18 +1899,8 @@ pub struct Architecture {
     pub analysis_fid_strict: bool,
     /// (kuna) Name library functions from FLIRT `.sig` files listed in `KUNA_FLIRT_SIGS` (`flirt`). Default off.
     pub analysis_flirt: bool,
-    /// (kuna) Gate the MSVC RTTI / vftable recovery pass (`rtti`); default **off**.
-    /// The kuna analog of Ghidra's `RttiAnalyzer` (a Microsoft-PE analyzer): on a
-    /// Windows PE it parses the `CompleteObjectLocator` → RTTI3/2/1 → RTTI0 graph in
-    /// `.rdata`/`.data`, demangles each `.?A…@@` class name, and emits
-    /// `<Class>::vftable` / `<Class>::RTTI_Complete_Object_Locator` /
-    /// `<Class>::RTTI_Type_Descriptor` labels so the C++ class names (`Box`/`Shape`)
-    /// surface as recovered symbols and the virtual-dispatch metadata graph is
-    /// named. PE-only (registered in `passes_for` only for `BinaryFormat::Pe`, and
-    /// the pass also self-gates on PE in `run`), real-PE path only ⇒ every ELF/XML
-    /// parity gate is byte-identical. Default-off (output-changing: it adds named
-    /// data symbols); `--option rtti on` enables it.
-    pub analysis_rtti: bool,
+    /// Gate the MSVC RTTI / class recovery pass (`rtti`), PE-only.
+    pub analysis_rtti: RttiMode,
     /// (kuna, NOVEL) Gate the Itanium (GCC/Clang) RTTI + vtable recovery pass
     /// (`itaniumrtti`); default **off**. Ghidra has no Itanium RTTI analyzer at all
     /// — its `RttiAnalyzer` is Microsoft-only and its GCC class recovery is
@@ -2757,7 +2774,7 @@ impl Architecture {
             analysis_fid: false,
             analysis_fid_strict: false,
             analysis_flirt: false,
-            analysis_rtti: false,
+            analysis_rtti: RttiMode::Off,
             analysis_itaniumrtti: false,
             analysis_panicloc: false,
             analysis_aif: crate::kuna_aif::AifMode::Off,
@@ -3130,7 +3147,7 @@ impl Architecture {
         self.analysis_fid = false; // FID fingerprint matcher consumer default-off
         self.analysis_fid_strict = false;
         self.analysis_flirt = false;
-        self.analysis_rtti = true; // MSVC RTTI / vftable recovery (PE-only pass)
+        self.analysis_rtti = RttiMode::Classes; // MSVC RTTI / full class recovery (PE-only pass)
         self.analysis_panicloc = true; // (kuna) default-on, Rust images only: the pass is registered for a rustc-detected image and the XML datatest path never runs an analysis pass (0/675)
         self.analysis_itaniumrtti = true; // (kuna, NOVEL) Itanium RTTI / vtable recovery (ELF-only pass)
         self.analysis_aif = crate::kuna_aif::AifMode::Off; // Aggressive Instruction Finder gap-walk default-off; `aggressive` sets `strict`

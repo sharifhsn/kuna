@@ -2098,7 +2098,13 @@ extra declines, never a wrong excision.
 * A hand-built `FuncCallSpecs` has **no prototype store**, and every later
   `FuncProto::store` query panics on the null. Decoder-produced specs get theirs from
   `ActionDefaultParams`; a synthesized one must call
-  `proto_mut().attach_internal_store(void_ty)`.
+  `proto_mut().set_internal(model, void_ty)`. The transform checks for the
+  prototype model and void type before redirecting an edge. The synthetic call
+  is anchored at the region head and has zero stack adjustment. Regions that
+  write any part of the stack-pointer register stay inline. The return register
+  counts as a live output if a path from the exit reaches a return before it
+  overwrites that register. An independent live output then keeps the region
+  inline, since one synthesized call result cannot carry both values.
 
 ### v1 restrictions
 

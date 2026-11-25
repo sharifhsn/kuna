@@ -5,6 +5,8 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use crate::common::process::Capped;
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../..")
@@ -28,8 +30,8 @@ fn specs() -> String {
 fn run_kuna(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_kuna"))
         .args(args)
-        .output()
-        .expect("failed to spawn kuna")
+        .capped_output()
+        .expect("failed to run kuna")
 }
 
 fn parse_hex(raw: &str) -> u64 {
@@ -77,6 +79,131 @@ fn verify_index_slices(dir: &Path, expect_base: u64, expect_file_prefix: Option<
 }
 
 #[test]
+fn completed_project_indexes_and_documents_the_selected_layout() {
+    let bin = fixture("pdb_prog.exe");
+    for (layout, schedule, prefix) in [
+        ("rva-slab", None, Some("src/")),
+        ("rva-file", Some("--progress"), Some("funcs/")),
+        ("both", Some("--stream"), Some("src/")),
+        ("turso", None, None),
+    ] {
+        let out_dir = tempfile::tempdir().unwrap();
+        let dir = out_dir.path();
+        let sp = specs();
+        let mut args = vec![
+            "decompile-project", &bin, "-o", dir.to_str().unwrap(), "--functions",
+            "pdb_demo_compute", "--sleighpath", &sp, "--layout", layout,
+            "--shard-align", "0x200", "--no-asm",
+        ];
+        args.extend(schedule);
+        let out = run_kuna(&args);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(verify_index_slices(dir, 0x140000000, prefix), 1);
+        let row: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("index.jsonl")).unwrap()).unwrap();
+        let expected_bucket = parse_hex(row["rva"].as_str().unwrap()) & !0x1ff;
+        assert_eq!(row["shard"], format!("0x{expected_bucket:08x}"));
+        let rva = parse_hex(row["rva"].as_str().unwrap());
+        match layout {
+            "rva-slab" | "both" => assert_eq!(row["c_file"], format!("src/rva_{expected_bucket:08x}.c")),
+            "rva-file" => assert_eq!(row["c_file"], format!("funcs/0x{expected_bucket:08x}/0x{rva:08x}.c")),
+            _ => assert!(row["c_file"].is_null()),
+        }
+
+
+        let readme = std::fs::read_to_string(dir.join("README.md")).unwrap();
+        for folder in ["src", "funcs"] {
+            assert_eq!(readme.contains(&format!("`{folder}/`")), dir.join(folder).is_dir());
+        }
+        for path in ["pdb_prog.exe.c", "pdb_prog.exe.asm", "pdb_prog.exe.h", "shards.json", "functions.db", "index.jsonl"] {
+            assert_eq!(
+                readme.contains(&format!("`{path}`")), dir.join(path).is_file(),
+                "inventory mismatch for {path} under {layout}"
+            );
+        }
+    }
+}
+
+#[test]
+fn query_preserves_unsigned_rva_order_and_literal_name_characters() {
+    let bin = fixture("pdb_prog.exe");
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().to_str().unwrap();
+    let out = run_kuna(&[
+        "decompile-project", &bin, "-o", dir, "--functions", "pdb_demo_compute", "--layout",
+        "turso", "--no-asm", "--sleighpath", &specs(),
+    ]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(async {
+        let path = temp.path().join("functions.db");
+        let db = turso::Builder::new_local(path.to_str().unwrap()).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        // Store the same two's-complement INTEGER representation as the exporter.
+        for (start, end, name) in [
+            (i64::MAX - 2, i64::MIN + 3, "name_a"),
+            (i64::MIN + 3, i64::MIN + 9, "nameXa"),
+        ] {
+            conn.execute(
+                "INSERT INTO functions (rva,va,end_rva,shard_rva,name,size) VALUES (?1,?1,?2,?1,?3,6)",
+                (start, end, name),
+            ).await.unwrap();
+        }
+    });
+
+    let query = |flag, value| {
+        let out = run_kuna(&["query", dir, flag, value, "--json"]);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        doc["functions"].as_array().unwrap().iter()
+            .map(|row| row["name"].as_str().unwrap().to_owned()).collect::<Vec<_>>()
+    };
+    assert_eq!(query("--range", "0..=0xffffffffffffffff"), ["pdb_demo_compute", "name_a", "nameXa"]);
+    assert_eq!(query("--range", "0x7ffffffffffffffd..0x8000000000000003"), ["name_a"]);
+    assert_eq!(query("--rva", "0x8000000000000001"), ["name_a"]);
+    assert_eq!(query("--rva", "0x8000000000000003"), ["nameXa"]);
+    assert_eq!(query("--name", "name_a"), ["name_a"]);
+    assert_eq!(query("--name", "name*a"), ["name_a", "nameXa"]);
+}
+
+#[test]
+fn streamed_workers_agree_on_load_time_msvc_class_layouts() {
+    for (image, entry, area) in [
+        ("msvc_rtti_x64.exe", "0x140001010", "0x140001040"),
+        ("msvc_rtti_x86.exe", "0x401010", "0x401030"),
+    ] {
+        let mut snapshots = Vec::new();
+        for jobs in ["1", "2"] {
+            let temp = tempfile::tempdir().unwrap();
+            let dir = temp.path();
+            let out = run_kuna(&[
+                "decompile-project", &fixture(image), "-o", dir.to_str().unwrap(),
+                "--sleighpath", &specs(), "--stream", "--jobs", jobs, "--jobs-chunk", "1",
+                "--addr", entry, "--addr", area, "--layout", "rva-slab", "--no-asm",
+                "--option", "rtti", "classes", "--option", "protoorder", "off",
+            ]);
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            let header = std::fs::read_to_string(dir.join(format!("{image}.h"))).unwrap();
+            let mut records = Vec::new();
+            for name in ["Box", "Box_vftable"] {
+                let marker = format!("struct {name} {{");
+                let (_, fields) = header.split_once(&marker).expect("completed class record");
+                records.push(fields.split_once("\n};").expect("end of struct").0.to_owned());
+            }
+            let index = std::fs::read_to_string(dir.join("index.jsonl")).unwrap();
+            let row = index.lines().map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+                .find(|r| r["addr"] == area).unwrap();
+            let code = std::fs::read(dir.join(row["c_file"].as_str().unwrap())).unwrap();
+            let start = row["c_offset"].as_u64().unwrap() as usize;
+            let size = row["c_len"].as_u64().unwrap() as usize;
+            let body = std::str::from_utf8(&code[start..start + size]).unwrap();
+            assert!(body.contains("Box *this"), "{body}");
+            snapshots.push((records, body.to_owned()));
+        }
+        assert_eq!(snapshots[0], snapshots[1], "{image}");
+    }
+}
+
+#[test]
 fn invalid_layout_and_shard_align_exit_2() {
     let bin = fixture("fauxware");
     for bad in [
@@ -117,7 +244,7 @@ fn default_single_layout_preserves_artifacts_and_enriches_progress_index() {
     assert!(tmp.path().join("fauxware.h").is_file());
     assert!(tmp.path().join("fauxware.asm").is_file());
     assert!(tmp.path().join("README.md").is_file());
-    assert!(!tmp.path().join("slabs").exists());
+    assert!(!tmp.path().join("src").exists());
     assert!(!tmp.path().join("funcs").exists());
     assert!(!tmp.path().join("functions.db").exists());
     assert!(!tmp.path().join("shards.json").exists());
@@ -193,7 +320,7 @@ fn rva_slab_and_rva_file_serial_and_stream_jobs2() {
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert!(!slab_stream.path().join(".streaming").exists());
     assert!(!slab_stream.path().join("fauxware.asm").exists());
-    let streamed_count = verify_index_slices(slab_stream.path(), 0x400000, Some("slabs/rva_"));
+    let streamed_count = verify_index_slices(slab_stream.path(), 0x400000, Some("src/rva_"));
     assert_eq!(streamed_count as u64, manifest["total_functions"].as_u64().unwrap());
 
     // Stream + --jobs 2 rva-file
@@ -215,7 +342,7 @@ fn rva_slab_and_rva_file_serial_and_stream_jobs2() {
         &sp,
     ]);
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
-    let file_count = verify_index_slices(file_stream.path(), 0x400000, Some("funcs/rva_"));
+    let file_count = verify_index_slices(file_stream.path(), 0x400000, Some("funcs/0x"));
     assert_eq!(file_count, streamed_count);
     let index_text = std::fs::read_to_string(file_stream.path().join("index.jsonl")).unwrap();
     let first: serde_json::Value = serde_json::from_str(index_text.lines().next().unwrap()).unwrap();
@@ -247,7 +374,7 @@ fn turso_and_both_layouts_round_trip_with_kuna_query() {
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert!(both_dir.path().join("functions.db").is_file());
     assert!(both_dir.path().join("shards.json").is_file());
-    assert!(both_dir.path().join("slabs").is_dir());
+    assert!(both_dir.path().join("src").is_dir());
     assert!(!both_dir.path().join("fauxware.c").exists());
     assert!(!both_dir.path().join("fauxware.asm").exists());
 
@@ -271,7 +398,7 @@ fn turso_and_both_layouts_round_trip_with_kuna_query() {
     assert_eq!(main_fn["name"], "main");
     let main_rva = main_fn["rva"].as_str().unwrap();
     assert!(
-        main_fn["shard_file"].as_str().unwrap().starts_with("slabs/rva_"),
+        main_fn["shard_file"].as_str().unwrap().starts_with("src/rva_"),
         "expected shard_file in both layout: {main_fn}"
     );
     assert!(main_fn["code"].as_str().unwrap().contains("main"));
@@ -316,7 +443,7 @@ fn turso_and_both_layouts_round_trip_with_kuna_query() {
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert!(turso_stream.path().join("functions.db").is_file());
     assert!(!turso_stream.path().join("fauxware.c").exists());
-    assert!(!turso_stream.path().join("slabs").exists());
+    assert!(!turso_stream.path().join("src").exists());
     let n = verify_index_slices(turso_stream.path(), 0x400000, None);
     assert_eq!(n as i64, sum_json["counts"]["functions"].as_i64().unwrap());
 

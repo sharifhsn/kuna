@@ -323,6 +323,7 @@ pub fn kuna_live_value(conf: &Architecture, option: &str) -> Option<Cow<'static,
         // (kuna `cppsig`) Three-valued, so it reports its own token rather than
         // on/off.
         "cppsig" => conf.analysis_cppsig.as_str(),
+        "rtti" => conf.analysis_rtti.as_str(),
         "addrtable" => on_off(conf.analysis_addrtable),
         "listing" => on_off(conf.analysis_listing),
         "fid" => if !conf.analysis_fid { "off" } else if conf.analysis_fid_strict { "strict" } else { "on" },

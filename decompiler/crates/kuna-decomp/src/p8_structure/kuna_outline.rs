@@ -437,27 +437,18 @@ fn op_output(data: &Funcdata, op: OpId) -> Option<Store> {
 }
 
 
-/// Does any continuation block end in a `RETURN`?
-fn continuation_returns(data: &Funcdata, cont: &BTreeSet<BlockId>) -> bool {
-    cont.iter().any(|&bl| {
-        data.bb_ops(bl).iter().any(|&op| {
-            data.obank().get(op).map(|o| o.code() == OpCode::CPUI_RETURN).unwrap_or(false)
-        })
-    })
-}
-
-/// Storage the region wrote that the continuation never redefines and that is a
-/// plausible return value.
-///
-/// Restricted to the storage the *containing function's own prototype* names as its
-/// output, so this cannot invent a result for a void function. Returns `None` when
-/// the function has no output storage or the region did not write it.
+/// Is the region's write to the declared return storage still visible at a
+/// return? A definition on a different continuation path cannot kill it.
 fn returned_storage(
     data: &Funcdata,
     members: &BTreeSet<BlockId>,
-    cont: &BTreeSet<BlockId>,
+    exit: BlockId,
 ) -> Option<Store> {
-    let out = data.get_func_proto().get_output();
+    let proto = data.get_func_proto();
+    if !proto.has_store() {
+        return None;
+    }
+    let out = proto.get_output();
     let addr = out.get_address().clone();
     let size = out.get_size();
     if size <= 0 {
@@ -474,22 +465,45 @@ fn returned_storage(
     if !wrote {
         return None;
     }
-    let redefined = cont.iter().any(|&bl| {
-        data.bb_ops(bl)
-            .iter()
-            .any(|&op| op_output(data, op).map(|st| st.key == key).unwrap_or(false))
-    });
-    if redefined {
-        return None;
+    let mut work = vec![exit];
+    let mut seen = BTreeSet::new();
+    while let Some(bl) = work.pop() {
+        if members.contains(&bl) || !seen.insert(bl) {
+            continue;
+        }
+        let mut overwritten = false;
+        for op in data.bb_ops(bl) {
+            if data.obank().get(op).is_some_and(|o| o.code() == OpCode::CPUI_RETURN) {
+                return Some(Store { key, space, offset: addr.get_offset(), size });
+            }
+            if op_output(data, op).is_some_and(|st| st.key == key) {
+                overwritten = true;
+                break;
+            }
+        }
+        if !overwritten {
+            let block = data.bblocks_ref().block(bl);
+            work.extend((0..block.size_out()).map(|i| block.get_out(i)));
+        }
     }
-    Some(Store { key, space, offset: addr.get_offset(), size })
+    None
 }
 
 /// Does any member block hold a call or a store this pass will not reason about?
 fn has_unmodelled_side_effect(data: &Funcdata, members: &BTreeSet<BlockId>) -> bool {
+    let stack_pointer = data.get_arch().manage().get_stack_space()
+        .and_then(|s| s.get_spacebase(0).ok());
     for &bl in members {
         for op in data.bb_ops(bl) {
             let Some(o) = data.obank().get(op) else { continue };
+            if let (Some(sp), Some(out)) = (&stack_pointer, op_output(data, op)) {
+                if sp.space.as_ref().is_some_and(|space| space.get_index() == out.space.get_index())
+                    && u128::from(sp.offset) < u128::from(out.offset) + out.size as u128
+                    && u128::from(out.offset) < u128::from(sp.offset) + u128::from(sp.size)
+                {
+                    return true;
+                }
+            }
             match o.code() {
                 OpCode::CPUI_CALL
                 | OpCode::CPUI_CALLIND
@@ -572,25 +586,26 @@ fn outline_one(data: &mut Funcdata, run: &OutlineRun) -> KunaResult<bool> {
     let cont = reachable_from(data, exit_bl, &members);
     let (live_in, mut live_out) = region_liveness(data, &members, &cont);
 
-    // Pre-SSA the RETURN op does not yet carry the return VALUE as an input - return
-    // storage is recovered later - so a region whose only live-out is the value the
-    // function returns shows zero live-outs, and excising it silently drops the
-    // result.  That is an UNDER-approximation, the one direction the liveness is not
-    // allowed to err in.  Found by the coreutils LLM evaluation on two independent
-    // `du` witnesses, both reporting "0 result(s)" for a region computing the return.
-    //
-    // If the continuation can reach a RETURN, treat storage the region wrote and the
-    // continuation never redefines as potentially returned, and fold it in.  Pushing
-    // past one live-out simply declines, which is the safe outcome.
-    if !live_out.iter().any(|_| true) && continuation_returns(data, &cont) {
-        let maybe = returned_storage(data, &members, &cont);
-        if let Some(st) = maybe {
-            live_out.push(st);
-        }
+    // RETURN acquires its value after SSA. Count a surviving return register
+    // even when the continuation also reads another output.
+    if let Some(st) = returned_storage(data, &members, exit_bl) {
+        live_out.push(st);
+        live_out = merge_overlapping(live_out);
     }
     if live_out.len() > 1 {
         return Ok(false);
     }
+
+    let void_ty = match data.get_arch().types().map(|t| t.get_type_void()) {
+        Some(Ok(t)) => t,
+        _ => return Ok(false),
+    };
+    let model = match data.get_arch().eval_fp_called().cloned() {
+        Some(m) => m,
+        // No default model registered (hand-built fixture): decline rather than
+        // synthesize a call whose stack effect is unknown.
+        None => return Ok(false),
+    };
 
     // ---- surgery -----------------------------------------------------------
     // A fresh EMPTY block on the single entry edge.
@@ -608,7 +623,6 @@ fn outline_one(data: &mut Funcdata, run: &OutlineRun) -> KunaResult<bool> {
     data.bblocks_mut().switch_edge(pred, head_bl, call_bl);
     data.bblocks_mut().add_edge(call_bl, exit_bl);
 
-    let site = data.bblocks_block_start(call_bl);
     let head_addr = data.bblocks_block_start(head_bl);
     let name = format!("outlined_0x{:x}", head_addr.get_offset());
 
@@ -616,7 +630,7 @@ fn outline_one(data: &mut Funcdata, run: &OutlineRun) -> KunaResult<bool> {
     // produced; this builds one from nothing, so it installs the fspec annotation
     // by hand exactly as FlowInfo::build_call_specs does.
     let nargs = live_in.len() as int4;
-    let callop = data.new_op(1 + nargs, site.clone());
+    let callop = data.new_op(1 + nargs, head_addr.clone());
     data.op_set_opcode_code(callop, OpCode::CPUI_CALL);
 
     let mut fc = FuncCallSpecs::new(callop, head_addr.clone());
@@ -632,17 +646,11 @@ fn outline_one(data: &mut Funcdata, run: &OutlineRun) -> KunaResult<bool> {
     // normalization fails for the calls that FOLLOW the outlined one, raw `RSP` leaks
     // into the C as `&Stack...`, and a later `memcpy` prints with four arguments.
     // Found by the coreutils LLM evaluation on `factor::lbuf_putc`.
-    let void_ty = match data.get_arch().types().map(|t| t.get_type_void()) {
-        Some(Ok(t)) => t,
-        _ => return Ok(false),
-    };
-    let model = match data.get_arch().eval_fp_called().cloned() {
-        Some(m) => m,
-        // No default model registered (hand-built fixture): decline rather than
-        // synthesize a call whose stack effect is unknown.
-        None => return Ok(false),
-    };
     fc.proto_mut().set_internal(model, void_ty);
+    // The original edge pushed no return address. A region that writes the
+    // stack-pointer register was declined before the graph was edited.
+    fc.proto_mut().set_extra_pop(0);
+    fc.set_effective_extra_pop(0);
     let idx = data.push_call_specs(fc);
     let handle = crate::flow::next_fspec_handle();
     let angr = data.get_arch().kuna_name_style();

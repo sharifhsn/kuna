@@ -7860,8 +7860,24 @@ impl PrintC {
             fd.obank()
                 .get(op)
                 .and_then(|o| o.get_out())
-                .map(|out| crate::kuna_bitcast::array_float_conversion(fd, op)
-                    .unwrap_or_else(|| fd.vn_type_def_facing(out)))
+                .map(|out| {
+                    let nominal = crate::kuna_bitcast::array_float_conversion(fd, op)
+                        .unwrap_or_else(|| fd.vn_type_def_facing(out));
+                    if self.out_lang == crate::kuna_lang::OutLang::C
+                        && self.stmt_op == Some(op)
+                        && nominal.get_metatype() == type_metatype::TYPE_PTR
+                    {
+                        let declared = fd.vbank().get(out).and_then(|v| v.get_high())
+                            .and_then(|high| self.declared_local(high))
+                            .and_then(|local| local.ty.as_ref());
+                        if let Some(cast) = declared.and_then(|ty| {
+                            crate::p9_emit::kuna_memberbase::assigned_slot_type(fd, op, &nominal, ty)
+                        }) {
+                            return cast;
+                        }
+                    }
+                    nominal
+                })
         };
         if self.out_lang == crate::kuna_lang::OutLang::Rust {
             if let (Some(ct), Some(vn)) = (cast_ty.as_ref(), fd.obank().get(op).and_then(|o| o.get_in(0))) {

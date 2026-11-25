@@ -34,6 +34,8 @@
 //! Everything runs on the real-PE path (loading an actual PE), so the XML
 //! datatest 675/158 oracles never reach this.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -64,21 +66,29 @@ fn fixtures() -> PathBuf {
     repo_root().join("decompiler/crates/kuna-analysis/tests/fixtures")
 }
 
-/// A scratch directory holding a copy of `pdb_prog.exe` and nothing else, so the
-/// sidecar tiers find only what a test puts there.
-fn isolated_exe(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("kuna-verify-pdb-{tag}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create the scratch dir");
-    let exe = dir.join("pdb_prog.exe");
-    std::fs::copy(fixtures().join("pdb_prog.exe"), &exe).expect("copy the PE");
-    exe
+struct FixtureCopy(PathBuf);
+
+impl FixtureCopy {
+    fn new(source: &Path, tag: &str) -> Self {
+        let dir = common::scratch_file(tag, "dir");
+        std::fs::create_dir(&dir).expect("create private test scratch");
+        let exe = dir.join(source.file_name().unwrap());
+        std::fs::copy(source, &exe).expect("copy the PE");
+        Self(exe)
+    }
+}
+
+impl Drop for FixtureCopy {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(self.0.parent().unwrap());
+    }
 }
 
 /// How to drive one run: which EXE to load, what `kuna_pdb_path` holds, and
 /// whether the `pdb` option is explicitly turned off before the commit.
 struct Run {
     exe: PathBuf,
+    _copy: Option<FixtureCopy>,
     env: Option<PathBuf>,
     force_off: bool,
 }
@@ -86,11 +96,12 @@ struct Run {
 impl Run {
     /// The vendored fixture, in its own directory (the sidecar is present).
     fn fixture() -> Run {
-        Run { exe: fixtures().join("pdb_prog.exe"), env: None, force_off: false }
+        Run { exe: fixtures().join("pdb_prog.exe"), _copy: None, env: None, force_off: false }
     }
     /// A copy of the fixture alone in a scratch directory (no sidecar).
     fn isolated(tag: &str) -> Run {
-        Run { exe: isolated_exe(tag), env: None, force_off: false }
+        let copy = FixtureCopy::new(&fixtures().join("pdb_prog.exe"), tag);
+        Run { exe: copy.0.clone(), _copy: Some(copy), env: None, force_off: false }
     }
     fn env(mut self, pdb: PathBuf) -> Run {
         self.env = Some(pdb);
@@ -310,17 +321,41 @@ fn pdb_cpp_publics_are_demangled() {
     );
 }
 
-/// Optional deep end-to-end verification against the MSVC `/O2 /Zi /GR /DEBUG:FULL`
-/// `cpp_suite.exe` + `cpp_suite.pdb` fixture when present under `/tmp/kuna_msvc_fixtures`.
 #[test]
-fn pdb_msvc_cpp_suite_full_recovery_when_present() {
+fn codeview_inline_ranges_belong_to_their_two_callers() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let exe = PathBuf::from("/tmp/kuna_msvc_fixtures/cpp_suite.exe");
-    let pdb = PathBuf::from("/tmp/kuna_msvc_fixtures/cpp_suite.pdb");
-    let stripped = PathBuf::from("/tmp/kuna_msvc_fixtures/stripped/cpp_suite_stripped.exe");
-    if !exe.exists() || !pdb.exists() || !stripped.exists() {
-        return;
+    std::env::remove_var(PDB_PATH_ENV);
+    std::env::remove_var(kuna_decomp::kuna_loadoptions::PDB_IGNORE_GUID_ENV);
+    let specs = vec![repo_root().join("specs").to_str().unwrap().to_owned()];
+    let exe = fixtures().join("pdb_inline.exe");
+    let mut prog = bootstrap_from_object(exe.to_str().unwrap(), "", &specs).unwrap();
+    prog.commit_pending_analysis().unwrap();
+    let entries = prog.function_entries_canonical();
+    for name in ["sample_left", "sample_right"] {
+        let base = entries.iter().find(|e| e.name == name).unwrap().addr.get_offset();
+        let sites = &prog.arch().inline_sites[&base];
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].inlinee_name, "scale_and_bias");
+        assert_eq!(sites[0].depth, 0);
+        assert_eq!(sites[0].ranges, [(base + 1, base + 12)]);
     }
+    let alone = FixtureCopy::new(&exe, "pdb-inline-alone");
+    let mut bare = bootstrap_from_object(alone.0.to_str().unwrap(), "", &specs).unwrap();
+    bare.commit_pending_analysis().unwrap();
+    assert!(bare.arch().inline_sites.is_empty());
+}
+
+/// Optional large MSVC /O2 /Zi /GR reference build with its matching PDB.
+#[test]
+#[ignore = "requires an MSVC build of cpp_suite in KUNA_MSVC_FIXTURE_DIR"]
+fn pdb_msvc_cpp_suite_full_recovery() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = PathBuf::from(std::env::var_os("KUNA_MSVC_FIXTURE_DIR").expect("set KUNA_MSVC_FIXTURE_DIR"));
+    let exe = dir.join("cpp_suite.exe");
+    let pdb = dir.join("cpp_suite.pdb");
+    assert!(pdb.is_file(), "missing {}", pdb.display());
+    let alone = FixtureCopy::new(&exe, "msvc-suite-alone");
+    let stripped = &alone.0;
 
     std::env::remove_var(PDB_PATH_ENV);
     std::env::remove_var(kuna_decomp::kuna_loadoptions::PDB_IGNORE_GUID_ENV);

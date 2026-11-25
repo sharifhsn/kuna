@@ -43,6 +43,10 @@ pub(crate) fn fact_entries(out: &AnalysisOutput) -> HashSet<u64> {
     eager.extend(out.cpp_sig.msvc_builders.iter().map(|(a, _)| *a));
     eager.extend(out.pdb_prototypes.iter().map(|(a, _, _)| *a));
     eager.extend(out.inline_sites.iter().map(|s| s.caller_addr));
+    if let Some(mc) = &out.msvc_classes {
+        eager.extend(mc.function_symbols.iter().map(|s| s.addr));
+        eager.extend(mc.methods.iter().map(|m| m.addr));
+    }
     eager
 }
 

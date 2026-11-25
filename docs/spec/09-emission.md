@@ -175,6 +175,14 @@ when its storage representative is an array member. The array-declaration
 fallback must not replace the record with its first member: later field accesses
 still require the complete object, including fields after that array.
 
+For an explicit C assignment of a record-member address, a reused pointer local
+can have a different declaration from the cast at that instruction. When the
+IR casts the address to `T **` and the assigned local is declared `T *`, the
+printer spells the outer object-pointer conversion using the local's declared
+type. The member must be in the same record type at an offset aligned for that
+record. Both pointers must have the same width, word size and address space. Uses inside larger expressions retain their operation-specific
+types.
+
 With `stackviews`, a physical stack declaration can contain the scalar being
 cast rather than itself being that scalar. Bit-transfer classification descends
 through an exact member at the symbol offset and access width; a declared

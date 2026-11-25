@@ -39,10 +39,10 @@ pub(crate) fn take_global_pdb(argv: &mut Vec<String>) -> Result<(), String> {
     let mut i = 0;
     while i < argv.len() {
         if argv[i] == "--pdb" {
-            let value = argv.get(i + 1).cloned().ok_or("--pdb requires a value")?;
-            if value.is_empty() {
-                return Err("--pdb requires a value".into());
-            }
+            let value = argv.get(i + 1)
+                .filter(|value| !value.is_empty() && !value.starts_with('-'))
+                .ok_or("--pdb requires a value")?
+                .clone();
             argv.drain(i..i + 2);
             std::env::set_var(kuna_decomp::kuna_loadoptions::PDB_PATH_ENV, &value);
         } else if let Some(value) = argv[i].strip_prefix("--pdb=") {

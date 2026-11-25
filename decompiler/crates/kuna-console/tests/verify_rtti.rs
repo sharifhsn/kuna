@@ -75,9 +75,7 @@ fn fixtures() -> PathBuf {
     repo_root().join("decompiler/crates/kuna-analysis/tests/fixtures")
 }
 
-/// Bootstrap the named RTTI fixture, set `rtti` per `on`, then commit the (deferred)
-/// analysis facts.
-fn bootstrap_rtti(fixture: &str, on: bool) -> ConsoleProgram {
+fn bootstrap_rtti_mode(fixture: &str, mode: &str) -> ConsoleProgram {
     let bin = fixtures().join(fixture);
     assert!(bin.exists(), "missing fixture {bin:?}");
     let specs = repo_root().join("specs");
@@ -85,12 +83,18 @@ fn bootstrap_rtti(fixture: &str, on: bool) -> ConsoleProgram {
     let mut prog = bootstrap_from_object(bin.to_str().unwrap(), "", &spec_roots)
         .expect("bootstrap fixture with built processor specs");
     prog.arch_mut()
-        .set_kuna_option("rtti", if on { "on" } else { "off" })
+        .set_kuna_option("rtti", mode)
         .expect("rtti flips");
     // Analysis facts commit at `read symbols` (gated by the per-pass flag), not
     // eagerly at bootstrap — trigger that commit after the option is applied.
     prog.commit_pending_analysis().expect("analysis commit succeeds");
     prog
+}
+
+/// Bootstrap the named RTTI fixture, set `rtti` per `on`, then commit the (deferred)
+/// analysis facts.
+fn bootstrap_rtti(fixture: &str, on: bool) -> ConsoleProgram {
+    bootstrap_rtti_mode(fixture, if on { "on" } else { "off" })
 }
 
 /// The recovered-symbol assertions shared by the x64 and x86 arms: with `rtti on`,
@@ -201,4 +205,94 @@ fn x86_recovers_class_names_with_option_on() {
 fn x86_class_names_absent_with_option_off() {
     let prog = bootstrap_rtti("msvc_rtti_x86.exe", false);
     assert_absent(&prog, BOX_AREA_VMA_X86);
+}
+
+fn decompile_at(mut prog: ConsoleProgram, vma: u64) -> String {
+    use kuna_console::ifacedecomp::{
+        execute, register_decomp_commands, IfaceDecompData, DECOMPILE_MODULE,
+    };
+    use kuna_console::ifaceterm::ConsoleCommands;
+    let space = prog.arch().manage().get_default_code_space().expect("code space").clone();
+    let addr = kuna_base::address::Address::new(space, vma);
+    let name = match prog.arch().symboltab.find_function_across_scopes(&addr) {
+        Some((sid, _)) => prog.arch().symboltab.symbol(sid).get_name().to_string(),
+        None => prog.arch().name_function(&addr),
+    };
+    let fd = kuna_decomp::decompile_drive::build_and_follow_flow(
+        prog.arch_mut(),
+        &name,
+        addr,
+        kuna_console::engine::UNBOUNDED_SIZE,
+    )
+    .expect("function builds");
+    let mut status =
+        ConsoleCommands::into_status(vec!["decompile".to_string(), "print C".to_string()]);
+    register_decomp_commands(&mut status);
+    {
+        let data = status.get_data_mut(DECOMPILE_MODULE).unwrap();
+        let dcp = data.as_any_mut().downcast_mut::<IfaceDecompData>().unwrap();
+        dcp.conf = Some(prog);
+        dcp.fd = Some(fd);
+    }
+    execute(&mut status);
+    execute(&mut status);
+    status.optr
+}
+
+#[test]
+fn classes_mode_materializes_structs_and_names_mode_stays_labels_only() {
+    for (fixture, area_vma, field_off) in [
+        ("msvc_rtti_x64.exe", BOX_AREA_VMA_X64, "field_0x8"),
+        ("msvc_rtti_x86.exe", BOX_AREA_VMA_X86, "field_0x4"),
+    ] {
+        // `on` and alias `classes` materialize completed `Box` and `Box_vftable` structs
+        // and deduce `Box *this` + member field accesses.
+        for mode in ["on", "classes"] {
+            let prog = bootstrap_rtti_mode(fixture, mode);
+            assert_recovered(&prog, area_vma);
+            let box_ty = prog
+                .arch()
+                .types()
+                .find_by_name("Box")
+                .expect("type lookup")
+                .expect("Box struct must be materialized in classes mode");
+            assert!(!box_ty.is_incomplete(), "Box struct must be completed");
+            let vft_ty = prog
+                .arch()
+                .types()
+                .find_by_name("Box_vftable")
+                .expect("type lookup")
+                .expect("Box_vftable struct must be materialized in classes mode");
+            assert!(!vft_ty.is_incomplete(), "Box_vftable struct must be completed");
+            let code = decompile_at(prog, area_vma);
+            assert!(
+                code.contains("Box *this"),
+                "{fixture} ({mode}): expected `Box *this` in:\n{code}"
+            );
+            assert!(
+                code.contains(field_off),
+                "{fixture} ({mode}): expected `this->{field_off}` in:\n{code}"
+            );
+        }
+
+        // `names` keeps legacy labels without polluting TypeFactory with class structs.
+        let names_prog = bootstrap_rtti_mode(fixture, "names");
+        assert_recovered(&names_prog, area_vma);
+        assert!(
+            names_prog.arch().types().find_by_name("Box").expect("lookup").is_none(),
+            "{fixture} (names): Box struct must not be materialized in names-only mode"
+        );
+        assert!(
+            names_prog.arch().types().find_by_name("Box_vftable").expect("lookup").is_none(),
+            "{fixture} (names): Box_vftable must not be materialized in names-only mode"
+        );
+
+        // `off` leaves TypeFactory untouched as well.
+        let off_prog = bootstrap_rtti_mode(fixture, "off");
+        assert_absent(&off_prog, area_vma);
+        assert!(
+            off_prog.arch().types().find_by_name("Box").expect("lookup").is_none(),
+            "{fixture} (off): Box struct must not exist"
+        );
+    }
 }

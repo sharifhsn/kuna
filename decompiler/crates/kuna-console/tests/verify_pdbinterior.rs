@@ -27,11 +27,10 @@
 //! procedure and publishes its name, so the entry strictly inside it is rejected
 //! at the commit and the leaf decompiles whole.
 //!
-//! `static_leaf` at `0x140001340` is the same code as a `static` function: an
-//! `S_LPROC32` record and no public, so the `pdb` pass does not admit its start
-//! and the gap walk's `0x140001350` is the only function its code has. That entry
-//! must survive the default, and is rejected only once a function exists at
-//! `0x140001340`. The public `handler_leaf`, `caller_leaf` and `noreturn_leaf`
+//! `static_leaf` at `0x140001340` has a module-local `S_LPROC32` name.
+//! The companion fixture gives that record an empty name while preserving its
+//! extent. Its interior entry at `0x140001350` then has to survive until the
+//! outer function is independently admitted. The public `handler_leaf`, `caller_leaf` and `noreturn_leaf`
 //! hold entries their own flow never decodes (`0x1400013a0`, after the last `ret`;
 //! `0x1400013d0`, reached only by a call; `0x140001410`, past a call to `abort`),
 //! which must survive as well. A copy of the image whose CodeView fingerprint no
@@ -177,11 +176,22 @@ fn pdb_off_withdraws_the_extents() {
     );
 }
 
-/// A `static` function's procedure has no public, so nothing admits its start;
-/// the entry inside it is the only function its code has, and it stays.
+/// A module-local procedure supplies the start and protects its complete body.
+#[test]
+fn a_named_module_procedure_admits_the_static_leaf() {
+    let prog = bootstrap(&[]);
+    assert!(inventory(&prog).iter().any(|(vma, name, _)| *vma == STATIC_LEAF && name == "static_leaf"));
+    assert!(prog.lookup_symbol(STATIC_PHANTOM).is_none());
+    let body = decompile(prog, "static_leaf");
+    assert!(has_all_static_cases(&body) && !body.contains("funcboundflow"), "{body}");
+}
+
+/// With the same code and an unnamed procedure, its only discovered entry stays.
 #[test]
 fn default_keeps_the_only_entry_of_a_static_leaf() {
-    let prog = bootstrap(&[]);
+    let image = fixture("exe").with_file_name("pe_pdbinterior_x86_64_unnamed.exe");
+    let prog = bootstrap_image(&image, &[], None);
+    assert!(prog.lookup_symbol(LEAF).is_some() && prog.lookup_symbol(PHANTOM).is_none());
     assert!(
         prog.lookup_symbol("static_leaf").is_none(),
         "no public names the static leaf"

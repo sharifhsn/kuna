@@ -3262,6 +3262,15 @@ the two is a usage error.
 
 ## 1.4 Metadata analyzers
 
+`kuna functions --json` exposes compiler-attributed inline call sites on the
+owning function's record. The PDB reader uses CodeView inlinee IDs. The DWARF
+reader resolves named inline DIEs and origin or specification references within
+their compilation unit. Its IDs are offsets in the image's `.debug_info`.
+It uses the enclosing subprogram's entry PC or low PC, checks the recorded byte
+ranges against the subprogram's own ranges, and coalesces adjacent intervals.
+An unresolved name, owner, or range leaves that site out. A record gives its
+source format, ID, name, nesting depth, and half-open byte VMA ranges.
+
 The always-on core, in pass order (`passes.rs (passes_for)`):
 
 - **Strings** (`strings`, the `StringsAnalyzer` port,
@@ -5650,33 +5659,63 @@ every other binary's pass list is byte-identical to before the pass existed):
   when its functab lies in read-only data. The search runs only after every
   magic-based route has failed, so an image with an intact header never pays
   for it.
-- **MSVC RTTI** (`rtti`, PE-only, on by default and inert elsewhere;
-  `decompiler/crates/kuna-analysis/src/analyzers/rtti/mod.rs`): find the shared
-  `type_info` vftable, byte-search back from each `.?A…@@` TypeDescriptor to its
-  CompleteObjectLocator, validate the COL→RTTI3→RTTI2→RTTI1→RTTI0 reachability
-  chain (x86 raw-VA vs x64 image-base-relative refs behind a refkind dispatch), and
-  label `<Class>::vftable` / `RTTI_*` with the class names demangled by the
-  existing MSVC arm. From each recovered `<Class>::vftable` base the pass then walks
-  the slot array (`vftable.rs`), bounded at the first NULL or non-`.text` slot, and
-  emits one **function** symbol per surviving slot at the address it points at. That
-  symbol is named `<Class>::vfunc_<i>` — the class name comes from the RTTI0
-  `TypeDescriptor` and the slot index is the only disambiguator MSVC metadata offers,
-  since it records no per-method names. The stem is `vfunc_`, not `vftable_`, because
-  the name lands on *code*: a class compiled under multiple inheritance genuinely owns
-  more than one vftable, so an indexed `<Class>::vftable_<i>` reads as that class's
-  i-th table and made `kuna functions` report hundreds of bytes of executable
-  `std::basic_stringbuf` code as vtable objects. Only the table itself wears a
-  `vftable` name, and it is unindexed.
+- **MSVC RTTI and class recovery** (`rtti`, values `on|names|off` with `classes`
+  aliased to `on`, PE-only, `on` by default and inert elsewhere;
+  `decompiler/crates/kuna-analysis/src/analyzers/rtti/mod.rs`,
+  `decompiler/crates/kuna-analysis/src/analyzers/rtti/kuna_msvchierarchy.rs`,
+  `decompiler/crates/kuna-analysis/src/analyzers/rtti/kuna_msvcclasses.rs`): find the
+  shared `type_info` vftable, byte-search back from each `.?A…@@` TypeDescriptor to
+  every CompleteObjectLocator (`COL = ref − 12`), validate x64 `pSelf`
+  self-references (`image_base + pSelf == col_addr`) and the
+  COL→RTTI3→RTTI2→RTTI1→RTTI0 reachability chain (x86 raw-VA vs x64 `IBO32` refs
+  behind a refkind dispatch), and demangle each class name via the existing MSVC
+  arm. `kuna_msvchierarchy.rs` reconstructs the exact direct-base inheritance DAG
+  from the RTTI1 `numContainedBases` preorder subtree rule (covering single,
+  multiple, virtual, and diamond inheritance), groups all validated COLs per class
+  sorted by `col.offset`, maps secondary and virtual-base vftables (`col.offset > 0`)
+  to their owning base subobject via `PMD` (`mdisp`/`pdisp`/`vdisp`), labels
+  primary tables `<Class>::vftable` and secondary tables
+  `<Class>::vftable_for_<Base>`, walks each slot array (`vftable.rs`), and attributes
+  inherited slots to their defining ancestor while flagging unrelated multi-class
+  collisions (`/OPT:ICF` COMDAT folding or `_purecall`) so no single class's `this`
+  is bound to them.
 
-  The pass runs at every PE load whatever its gate says (its facts are committed
-  only when it is on), so its cost is paid by every command on a C++ DLL. Both of
-  its byte-searches — from the TypeDescriptors back to the words that reference
-  them, and from the validated CompleteObjectLocators forward to the meta slots
-  before their vftables — are therefore one scan of the image for every class at
-  once, grouping the hits by target and visiting them in image order, which emits
-  exactly what a search per class would. A search per class is
-  `O(classes × image)`: `torch_cpu.dll` (31,623 type descriptors in 309 MB) did
-  not finish loading in 30 minutes that way.
+  Under `rtti names`, only those RTTI/vftable labels, read-only ranges, and
+  virtual-method slot names (`<Class>::vfunc_<i>`) are committed, leaving
+  `TypeFactory` untouched. Under `rtti on` (alias `classes`, the default),
+  `kuna_msvcclasses.rs` runs at the deferred commit point using only deterministic
+  load-time inputs (so `--jobs N` and `--jobs N --stream` workers produce
+  byte-identical structs and hints without requiring `fast_funcdisc` or the
+  Listing): it lifts secondary-vftable adjustor thunks (`sub/add rcx/ecx, Δ; jmp`)
+  and `vtordisp` (`[this - 4]`) thunks, locates `operator delete`/`free` (by symbol
+  or a ≥2-class common conditional-callee fallback) and `_purecall`, detects
+  scalar/vector deleting destructors (`<Class>::scalar_deleting_destructor`) and
+  extracts inner `<Class>::~<Class>` destructors plus exact object sizes from sized
+  `operator delete`, classifies constructors (`<Class>::<Class>`) vs non-virtual
+  destructors via a bounded multi-block symbolic SLEIGH p-code walker over
+  `RCX`/`ECX` (tracking callee-saved registers, frame spills, and `vbptr` indirect
+  stores while rejecting stack/factory vptr writes), and synthesizes deterministic
+  cross-method member layouts across ctors, dtors, and virtual methods (reserving
+  embedded base subobjects, vptrs, `__vbptr`, and `vtordisp` while preferring
+  aligned scalar fields over coalesced zero-stores). At `commit_analysis_output`,
+  structs are materialized in strict base-first topological order (forward-declared
+  class shells, completed `<Class>_vftable` structs bound as `TypedDataFact` with
+  colliding untyped data labels suppressed, completed `<Class>` structs preserving
+  any already-complete PDB/DWARF record, then `C *` pointers), installing exact
+  `~C` and deleting-destructor prototypes before `cppsig` and `pdb_prototypes` and
+  `__thiscall` + `InputHintFact` `this` hints for ctors, virtual methods, and
+  thunks so extra parameters are preserved and PDB/DWARF/mangled signatures win
+  whenever present.
+
+  The load-time hierarchy pass runs at every PE load whatever its gate says (its
+  facts are committed only when enabled), so its cost is paid by every command on a
+  C++ DLL. Both of its byte-searches — from the TypeDescriptors back to the words
+  that reference them, and from the validated CompleteObjectLocators forward to the
+  meta slots before their vftables — are therefore one scan of the image for every
+  class at once, grouping the hits by target and visiting them in image order,
+  which emits exactly what a search per class would. A search per class is
+  `O(classes × image)`: `torch_cpu.dll` (31,623 type descriptors in 309 MB) did not
+  finish loading in 30 minutes that way.
 - **(kuna) Itanium RTTI** (`itaniumrtti`, ELF and Mach-O, on by default and inert elsewhere;
   `decompiler/crates/kuna-analysis/src/analyzers/rtti/kuna_itaniumrtti.rs`): the
   GCC/Clang counterpart of the pass above, and a capability with **no Ghidra
@@ -7789,11 +7828,9 @@ travel on their own channel and are applied after the FDE/`.pdata` suppression,
 under two more conditions checked at the commit. First, a procedure rejects
 anything only when a function is committed at its start: an entry that survived
 the first suppression, a function symbol an enabled pass emits, or a function
-already in the symbol table. The naming pass admits starts from the publics, and a
-`static` function has an `S_LPROC32` but no public (756 of the 3,268 procedures in
-each GH-468 testbed image), so without that condition an entry inside a static
-function nothing else found would be removed and its code left with no function at
-all. Second, only the entries that function's own code reaches are rejected. The
+already in the symbol table. Alongside public symbols, a named module-local procedure can supply this
+start. An unnamed procedure may still have an extent. Its interior entry
+stays available when the enclosing start has no independent owner. Second, only the entries that function's own code reaches are rejected. The
 commit decodes from the procedure's start, following fall-through and jumps but
 never leaving the procedure, entering a callee, or falling through a call it cannot
 prove returns — one to a target the decompiler treats as no-return (a no-return

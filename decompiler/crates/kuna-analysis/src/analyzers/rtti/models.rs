@@ -235,86 +235,185 @@ impl TypeDescriptor {
     }
 }
 
-/// An RTTI4 `CompleteObjectLocator` (COL) — the root of one class's RTTI graph.
+/// ClassHierarchyDescriptor attribute flags (MSVC RTTI3).
+pub const CHD_MULTINH: u32 = 0x1;
+pub const CHD_VIRTINH: u32 = 0x2;
+pub const CHD_AMBIGUOUS: u32 = 0x4;
+
+/// BaseClassDescriptor attribute flags (MSVC RTTI1).
+pub const BCD_NOTVISIBLE: u32 = 0x01;
+pub const BCD_AMBIGUOUS: u32 = 0x02;
+pub const BCD_PRIVORPROTBASE: u32 = 0x04;
+pub const BCD_PRIVORPROTINCOMPOBJ: u32 = 0x08;
+pub const BCD_VBOFCONTOBJ: u32 = 0x10;
+pub const BCD_NONPOLYMORPHIC: u32 = 0x20;
+pub const BCD_HASPCHD: u32 = 0x40;
+
+/// Pointer-to-member displacement triple inside an MSVC RTTI1 `BaseClassDescriptor`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pmd {
+    pub mdisp: i32,
+    pub pdisp: i32,
+    pub vdisp: i32,
+}
+
+impl Default for Pmd {
+    fn default() -> Self {
+        Pmd { mdisp: 0, pdisp: -1, vdisp: 0 }
+    }
+}
+
+/// An RTTI4 `CompleteObjectLocator` (COL) — the root of one vftable's RTTI graph.
 #[derive(Clone, Debug)]
 pub struct CompleteObjectLocator {
-    /// VMA of the COL base.
     pub addr: u64,
-    /// `signature` field (0 on x86, 1 on x64 — the `COL_SIG_REV1` marker).
     pub signature: u32,
-    /// Absolute VMA of the RTTI0 `TypeDescriptor` (resolved ref).
+    pub offset: u32,
+    pub cd_offset: u32,
     pub p_type_descriptor: u64,
-    /// Absolute VMA of the RTTI3 `ClassHierarchyDescriptor` (resolved ref).
     pub p_class_hierarchy: u64,
+    pub p_self: Option<u64>,
 }
 
 impl CompleteObjectLocator {
-    /// Field offsets (same on both arches; the refs are 4 bytes wide on both):
-    /// `signature u32 @0`, `offset u32 @4`, `cdOffset u32 @8`,
-    /// `pTypeDescriptor ref @12`, `pClassHierarchyDescriptor ref @16`.
+    const OFF_OFFSET: u64 = 4;
+    const OFF_CD_OFFSET: u64 = 8;
     const OFF_TYPE_DESCRIPTOR: u64 = 12;
     const OFF_CLASS_HIERARCHY: u64 = 16;
+    const OFF_SELF: u64 = 20;
 
-    /// Decode the COL at `addr`, resolving its two cross-references. `None` if either
-    /// reference is absent/unreadable.
+    /// Decode and validate the COL at `addr`. On x64 (`signature == 1`), when
+    /// `pSelf` is non-zero it must resolve back to `addr`.
     pub fn read(img: &ImageBytes, rk: &RefKind, addr: u64) -> Option<Self> {
         let signature = rk.read_u32(img.read(addr, 4)?);
+        let expected_sig = if rk.is64 { 1 } else { 0 };
+        if signature != expected_sig {
+            return None;
+        }
+        let offset = rk.read_u32(img.read(addr + Self::OFF_OFFSET, 4)?);
+        let cd_offset = rk.read_u32(img.read(addr + Self::OFF_CD_OFFSET, 4)?);
+        if offset > 0x10_0000 || cd_offset > 0x10_0000 {
+            return None;
+        }
         let p_type_descriptor =
             rk.resolve_ref(img.read(addr + Self::OFF_TYPE_DESCRIPTOR, rk.ref_size())?)?;
         let p_class_hierarchy =
             rk.resolve_ref(img.read(addr + Self::OFF_CLASS_HIERARCHY, rk.ref_size())?)?;
-        Some(CompleteObjectLocator { addr, signature, p_type_descriptor, p_class_hierarchy })
+        let p_self = if rk.is64 {
+            let self_ref = img.read(addr + Self::OFF_SELF, rk.ref_size())?;
+            let resolved = rk.resolve_ref(self_ref);
+            if let Some(s) = resolved {
+                if s != addr {
+                    return None;
+                }
+            }
+            resolved
+        } else {
+            None
+        };
+        Some(CompleteObjectLocator {
+            addr,
+            signature,
+            offset,
+            cd_offset,
+            p_type_descriptor,
+            p_class_hierarchy,
+            p_self,
+        })
     }
 }
 
 /// An RTTI3 `ClassHierarchyDescriptor`: the head of the inheritance list.
 #[derive(Clone, Debug)]
 pub struct ClassHierarchyDescriptor {
-    /// VMA of the CHD base.
     pub addr: u64,
-    /// Number of base classes (incl. self) — the RTTI2 array length.
+    pub signature: u32,
+    pub attributes: u32,
     pub num_base_classes: u32,
-    /// Absolute VMA of the RTTI2 `BaseClassArray` (resolved ref).
     pub p_base_class_array: u64,
 }
 
 impl ClassHierarchyDescriptor {
-    /// `signature u32 @0`, `attributes u32 @4`, `numBaseClasses u32 @8`,
-    /// `pBaseClassArray ref @12`.
+    const OFF_ATTRIBUTES: u64 = 4;
     const OFF_NUM_BASE: u64 = 8;
     const OFF_BASE_ARRAY: u64 = 12;
 
-    /// Decode the CHD at `addr`. `None` if the base-class array reference is absent
-    /// or the count is implausibly large (a corrupt/false candidate). MSVC class
-    /// hierarchies are small; a cap of 1024 rejects garbage while admitting any real
-    /// hierarchy.
+    /// Decode the CHD at `addr`.
     pub fn read(img: &ImageBytes, rk: &RefKind, addr: u64) -> Option<Self> {
+        let signature = rk.read_u32(img.read(addr, 4)?);
+        let attributes = rk.read_u32(img.read(addr + Self::OFF_ATTRIBUTES, 4)?);
         let num_base_classes = rk.read_u32(img.read(addr + Self::OFF_NUM_BASE, 4)?);
         if num_base_classes == 0 || num_base_classes > 1024 {
             return None;
         }
         let p_base_class_array =
             rk.resolve_ref(img.read(addr + Self::OFF_BASE_ARRAY, rk.ref_size())?)?;
-        Some(ClassHierarchyDescriptor { addr, num_base_classes, p_base_class_array })
+        Some(ClassHierarchyDescriptor {
+            addr,
+            signature,
+            attributes,
+            num_base_classes,
+            p_base_class_array,
+        })
     }
 }
 
-/// An RTTI1 `BaseClassDescriptor`: per-base subobject record. Only the leading
-/// `pTypeDescriptor` reference matters for name recovery (the `pmd` subobject
-/// offsets are surfaced as labels, not modeled here — the documented scope LOSS).
+/// An RTTI1 `BaseClassDescriptor`: per-base subobject record.
 #[derive(Clone, Debug)]
 pub struct BaseClassDescriptor {
-    /// VMA of the RTTI1 base.
     pub addr: u64,
-    /// Absolute VMA of this base's RTTI0 `TypeDescriptor` (resolved ref).
     pub p_type_descriptor: u64,
+    pub num_contained_bases: u32,
+    pub pmd: Pmd,
+    pub attributes: u32,
+    pub p_class_hierarchy: Option<u64>,
 }
 
 impl BaseClassDescriptor {
-    /// `pTypeDescriptor ref @0` (the first field).
+    const OFF_NUM_CONTAINED: u64 = 4;
+    const OFF_MDISP: u64 = 8;
+    const OFF_PDISP: u64 = 12;
+    const OFF_VDISP: u64 = 16;
+    const OFF_ATTRIBUTES: u64 = 20;
+    const OFF_CLASS_HIERARCHY: u64 = 24;
+
+    /// Decode the RTTI1 `BaseClassDescriptor` at `addr`.
     pub fn read(img: &ImageBytes, rk: &RefKind, addr: u64) -> Option<Self> {
         let p_type_descriptor = rk.resolve_ref(img.read(addr, rk.ref_size())?)?;
-        Some(BaseClassDescriptor { addr, p_type_descriptor })
+        let num_contained_bases = img
+            .read(addr + Self::OFF_NUM_CONTAINED, 4)
+            .map(|b| rk.read_u32(b))
+            .unwrap_or(0);
+        let pmd = match (
+            img.read(addr + Self::OFF_MDISP, 4),
+            img.read(addr + Self::OFF_PDISP, 4),
+            img.read(addr + Self::OFF_VDISP, 4),
+        ) {
+            (Some(m), Some(p), Some(v)) => Pmd {
+                mdisp: rk.read_u32(m) as i32,
+                pdisp: rk.read_u32(p) as i32,
+                vdisp: rk.read_u32(v) as i32,
+            },
+            _ => Pmd::default(),
+        };
+        let attributes = img
+            .read(addr + Self::OFF_ATTRIBUTES, 4)
+            .map(|b| rk.read_u32(b))
+            .unwrap_or(0);
+        let p_class_hierarchy = if attributes & BCD_HASPCHD != 0 {
+            img.read(addr + Self::OFF_CLASS_HIERARCHY, rk.ref_size())
+                .and_then(|b| rk.resolve_ref(b))
+        } else {
+            None
+        };
+        Some(BaseClassDescriptor {
+            addr,
+            p_type_descriptor,
+            num_contained_bases,
+            pmd,
+            attributes,
+            p_class_hierarchy,
+        })
     }
 }
 

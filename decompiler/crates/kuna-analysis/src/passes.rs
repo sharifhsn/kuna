@@ -1587,6 +1587,23 @@ pub fn run_operand_refs(
     out
 }
 
+/// Run deferred full MSVC C++ class recovery on a PE image using deterministic
+/// load-time inputs (so `--jobs N` workers produce byte-identical structs and locks).
+pub fn run_msvc_class_recovery(
+    bytes: &[u8],
+    arch: &Architecture,
+    translate: &dyn Translate,
+    known_entries: &[u64],
+) -> AnalysisOutput {
+    let Ok(file) = crate::loadimage_object::parse_object(bytes) else {
+        return AnalysisOutput::default();
+    };
+    let mut out =
+        crate::rtti::kuna_msvcclasses::run_msvc_class_recovery(&file, bytes, arch, translate, known_entries);
+    out.sanitize_names(symbolnamechars_mode());
+    out
+}
+
 /// (kuna `widestrings32`) The 4-byte string width alone, for a run with
 /// `operand_refs` off: the same linear decode [`run_operand_refs`] does, for the
 /// operand targets and table uses the facts weigh, without that pass's own facts.

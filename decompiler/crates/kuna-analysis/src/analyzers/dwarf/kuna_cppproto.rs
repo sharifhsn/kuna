@@ -191,7 +191,7 @@ fn var_arg_slot(die: &DieSnap, dies: &BTreeMap<usize, DieSnap>, nparams: usize) 
 /// An anonymous ancestor (an unnamed namespace or class) contributes nothing —
 /// Ghidra spells it `(anonymous namespace)`, but kuna resolves the prototype by
 /// address, so the shorter name only has to be a legible label.
-fn qualified_name(die: &DieSnap, dies: &BTreeMap<usize, DieSnap>) -> String {
+pub(super) fn qualified_name(die: &DieSnap, dies: &BTreeMap<usize, DieSnap>) -> String {
     let mut path: Vec<&str> = Vec::new();
     let mut cur = die.parent;
     // The DIE tree is finite and acyclic, but bound the walk anyway: a corrupt

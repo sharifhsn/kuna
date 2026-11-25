@@ -977,7 +977,16 @@ kuna_options! { self, p1;
         Ok(format!("FID fingerprint matcher set to {state}"))
     },
     "flirt" => on_off!(analysis_flirt, "FLIRT signature matcher Listing consumer"),
-    "rtti" => on_off!(analysis_rtti, "MSVC RTTI / vftable class-name recovery pass"),
+    "rtti" => {
+        let mode = match p1 {
+            "off" => crate::architecture::RttiMode::Off,
+            "names" => crate::architecture::RttiMode::Names,
+            "" | "on" | "classes" => crate::architecture::RttiMode::Classes,
+            _ => return Err(KunaError::parse("rtti expects on, names, classes, or off")),
+        };
+        self.analysis_rtti = mode;
+        Ok(format!("MSVC RTTI / class recovery set to {}", mode.as_str()))
+    },
     "itaniumrtti" => {
         on_off!(analysis_itaniumrtti, "Itanium (GCC/Clang) RTTI / vtable recovery pass")
     },

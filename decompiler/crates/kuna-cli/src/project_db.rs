@@ -548,6 +548,8 @@ fn extract_c_type_name(def: &str) -> Option<String> {
 
 // --- Read / query surface ----------------------------------------------------
 
+const FUNCTION_COLUMNS: &str = "rva, va, end_rva, shard_rva, shard_file, name, size, proto, code, error";
+
 #[derive(Debug, Clone)]
 pub struct QueriedFunction {
     pub rva: u64,
@@ -641,18 +643,23 @@ impl ProjectDbReader {
         self.rt.block_on(async {
             let mut exact = collect_functions(
                 &self.conn,
-                "SELECT rva, va, end_rva, shard_rva, shard_file, name, size, proto, code, error \
-                 FROM functions WHERE rva = ?1",
+                &format!("SELECT {FUNCTION_COLUMNS} FROM functions WHERE rva = ?1"),
                 vec![Value::Integer(rva as i64)],
             )
             .await?;
             if !exact.is_empty() {
                 return Ok(exact);
             }
+            // Older exports also store u64 addresses as their signed SQLite bit pattern.
+            // A positive start and negative end describe an extent crossing bit 63.
+            let covering = if rva <= i64::MAX as u64 {
+                "rva BETWEEN 0 AND ?1 AND (end_rva > ?1 OR end_rva < 0) ORDER BY rva DESC"
+            } else {
+                "(rva >= 0 OR rva <= ?1) AND end_rva < 0 AND end_rva > ?1 ORDER BY (rva < 0) DESC, rva DESC"
+            };
             exact = collect_functions(
                 &self.conn,
-                "SELECT rva, va, end_rva, shard_rva, shard_file, name, size, proto, code, error \
-                 FROM functions WHERE rva <= ?1 AND end_rva > ?1 ORDER BY rva DESC LIMIT 1",
+                &format!("SELECT {FUNCTION_COLUMNS} FROM functions WHERE {covering} LIMIT 1"),
                 vec![Value::Integer(rva as i64)],
             )
             .await?;
@@ -666,31 +673,33 @@ impl ProjectDbReader {
         end_rva: u64,
         inclusive: bool,
     ) -> Result<Vec<QueriedFunction>, String> {
-        let sql = if inclusive {
-            "SELECT rva, va, end_rva, shard_rva, shard_file, name, size, proto, code, error \
-             FROM functions WHERE rva >= ?1 AND rva <= ?2 ORDER BY rva"
-        } else {
-            "SELECT rva, va, end_rva, shard_rva, shard_file, name, size, proto, code, error \
-             FROM functions WHERE rva >= ?1 AND rva < ?2 ORDER BY rva"
-        };
+        if start_rva > end_rva {
+            return Err("RVA range starts after its end".into());
+        }
+        let crosses_sign_bit = start_rva <= i64::MAX as u64 && end_rva > i64::MAX as u64;
+        let join = if crosses_sign_bit { "OR" } else { "AND" };
+        let upper = if inclusive { "<=" } else { "<" };
+        let order = if crosses_sign_bit { "(rva < 0), rva" } else { "rva" };
+        let sql = format!(
+            "SELECT {FUNCTION_COLUMNS} FROM functions WHERE rva >= ?1 {join} rva {upper} ?2 ORDER BY {order}"
+        );
         self.rt.block_on(collect_functions(
             &self.conn,
-            sql,
+            &sql,
             vec![Value::Integer(start_rva as i64), Value::Integer(end_rva as i64)],
         ))
     }
 
     pub fn query_by_name(&self, pattern: &str) -> Result<Vec<QueriedFunction>, String> {
         let has_wild = pattern.contains('%') || pattern.contains('*');
-        let sql_pattern = if has_wild {
-            pattern.replace('*', "%")
-        } else {
-            format!("%{pattern}%")
-        };
+        let literal = pattern.replace('!', "!!").replace('_', "!_");
+        let sql_pattern = if has_wild { literal.replace('*', "%") } else { format!("%{literal}%") };
         self.rt.block_on(collect_functions(
             &self.conn,
-            "SELECT rva, va, end_rva, shard_rva, shard_file, name, size, proto, code, error \
-             FROM functions WHERE name LIKE ?1 ORDER BY CASE WHEN name = ?2 THEN 0 ELSE 1 END, rva",
+            &format!(
+                "SELECT {FUNCTION_COLUMNS} FROM functions WHERE name LIKE ?1 ESCAPE '!' \
+                 ORDER BY CASE WHEN name = ?2 THEN 0 ELSE 1 END, (rva < 0), rva"
+            ),
             vec![Value::Text(sql_pattern), Value::Text(pattern.to_string())],
         ))
     }

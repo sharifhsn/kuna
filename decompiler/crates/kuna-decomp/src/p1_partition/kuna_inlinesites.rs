@@ -1,12 +1,18 @@
-//! (kuna `pdb`) Parked inline-site records (`S_INLINESITE`/`S_INLINESITE2`) keyed
-//! by enclosing caller function VMA on [`crate::architecture::Architecture`].
+//! Compiler-attributed inline sites keyed by the enclosing caller address.
 
-/// One inlined callee instance inside a caller function, recovered from PDB
-/// `S_INLINESITE`/`S_INLINESITE2` + `ModuleInfo::inlinees()` + IPI `IdFinder`.
+/// Identity in the debug information for this image. Separate namespaces keep
+/// PDB IPI indices and DWARF section offsets distinct on mixed-debug inputs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum InlineeId {
+    Pdb(u32),
+    Dwarf(u64),
+}
+
+/// One inlined callee instance inside a caller function.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParkedInlineSite {
-    /// Raw IPI `IdIndex` of the inlinee (stable identity across callers).
-    pub inlinee_id: u32,
+    /// Identity of the inlinee in its source debug information.
+    pub inlinee_id: InlineeId,
     /// Normalized display name of the inlined function or method.
     pub inlinee_name: String,
     /// Inline nesting depth inside the caller (`0` for top-level inline sites).

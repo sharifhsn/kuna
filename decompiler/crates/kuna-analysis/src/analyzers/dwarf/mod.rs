@@ -67,7 +67,8 @@
 //!   the labels/call-sites below), and only fixed frame-relative locations.
 //!   Unsigned constant displacements are supported; register, piece, value, and
 //!   dereference expressions are left outside the fixed-local mapping path.
-//! - We skip `DW_TAG_label`, `DW_TAG_call_site`, inlined-subroutine, lexical-block
+//! - Inline-subroutine DIEs retain their compiler-attributed ranges.
+//!   We skip `DW_TAG_label`, `DW_TAG_call_site`, lexical-block
 //!   comments, and source-info/plate comments — all listing cosmetics with zero
 //!   decompiler-output payoff (the same scope as the strings/demangle losses).
 //! - **Aggregate layout is now imported** (`dwarfstructs`, [`kuna_dwarfstructs`]):
@@ -128,6 +129,7 @@ mod kuna_dwarfbyref;
 mod kuna_dwarflocation;
 pub(crate) mod kuna_dwarfcomplex;
 mod kuna_dwarflinkage;
+mod kuna_dwarfinlines;
 mod kuna_dwarfsignatures;
 pub mod kuna_godwarfsig;
 mod kuna_goformals;
@@ -1218,8 +1220,16 @@ impl DwarfPass {
 
             let signatures = kuna_goformals::generic_prototype_allowed(&unit)
                 && kuna_dwarfsignatures::has_signature_information(&dies);
-            for snap in dies.values() {
+            let mut inline_caller_ranges = BTreeMap::new();
+            for (&off, snap) in &dies {
                 match snap.tag {
+                    gimli::DW_TAG_inlined_subroutine => {
+                        if let Some(site) = kuna_dwarfinlines::site(
+                            &dwarf, &unit, &dies, off, snap, &mut inline_caller_ranges,
+                        ) {
+                            out.inline_sites.push(site);
+                        }
+                    }
                     gimli::DW_TAG_subprogram => {
                         // Defined function only: DW_AT_low_pc present and not a
                         // declaration-only DIE (DWARFFunction.read body-ranges guard).

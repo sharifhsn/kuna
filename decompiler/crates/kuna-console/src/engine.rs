@@ -3561,6 +3561,10 @@ impl ConsoleProgram {
                             merged.merge(out);
                         }
                     }
+                    // Snapshot deterministic load-time entries BEFORE Listing consumers run so
+                    // `--jobs 1` and `--jobs N` workers (with `fast_funcdisc off`) feed identical
+                    // inputs into MSVC class recovery.
+                    let load_time_entries = merged.entries.clone();
                     // Deferred Listing build + consumer/fast-inventory run, gated
                     // on the matching option. The call-fixup seed list is the names
                     // the load-time pass flagged resolved to addresses via the
@@ -3641,6 +3645,15 @@ impl ConsoleProgram {
                                 merged.merge(out);
                             }
                         }
+                    }
+                    if self.arch().analysis_rtti.classes() {
+                        let rtti_out = kuna_analysis::passes::run_msvc_class_recovery(
+                            &bytes,
+                            self.arch(),
+                            self.arch().translate(),
+                            &load_time_entries,
+                        );
+                        merged.merge(rtti_out);
                     }
                     // Deferred scalar/operand reference-markup pass, gated on the
                     // operand_refs flag (the kuna analog of Ghidra's
@@ -3962,7 +3975,7 @@ fn analysis_pass_enabled(arch: &Architecture, pass_id: &str) -> bool {
         // this gate is on. Default-OFF (output-changing: adds named data symbols),
         // PE-only (the pass + its passes_for registration both self-gate on PE), so
         // a default run / every non-PE binary commits nothing here.
-        "rtti" => arch.analysis_rtti,
+        "rtti" => arch.analysis_rtti.enabled(),
         // (kuna, NOVEL) Itanium (GCC/Clang) RTTI + vtable recovery — the class
         // names, typeinfo/vtable labels and per-slot virtual-method names are
         // computed at LOAD but COMMITTED only when this gate is on. Default-OFF
@@ -5902,6 +5915,354 @@ pub(crate) fn bootstrap_object(
 /// Bind each fact's function to its named prototype model, recovering its
 /// parameters and those of every direct call to it under that model. A model
 /// the registry does not hold is a silent no-op.
+fn commit_param_locks(
+    prog: &mut ConsoleProgram,
+    code_space: &Rc<AddrSpace>,
+    facts: &[kuna_analysis::pass::ParamLockFact],
+) {
+    for fact in facts {
+        let Ok(loc) = prog.arch().get_register_varnode(fact.reg.as_bytes()) else {
+            continue;
+        };
+        let Some(space) = loc.space.clone() else { continue };
+        let piece = kuna_decomp::fspec::ParameterPieces {
+            addr: Address::new(space, loc.offset),
+            type_: Some(Rc::clone(&fact.type_)),
+            flags: kuna_decomp::fspec::parameter_pieces_flags::TYPELOCK
+                | kuna_decomp::fspec::parameter_pieces_flags::NAMELOCK,
+        };
+        let entry = Address::new(Rc::clone(code_space), fact.func_addr);
+        let locks = prog.arch_mut().loader_param_locks.entry(entry).or_default();
+        locks.retain(|(i, _, _)| *i != fact.index);
+        locks.push((fact.index, fact.name.clone(), piece));
+    }
+}
+
+struct MaterializedMsvcClasses {
+    typed_vftables: Vec<kuna_analysis::pass::TypedDataFact>,
+    function_symbols: Vec<kuna_analysis::pass::SymFact>,
+    prototypes: Vec<(u64, kuna_decomp::fspec::PrototypePieces, Option<&'static str>)>,
+    models: Vec<kuna_analysis::pass::ModelFact>,
+    input_hints: Vec<kuna_analysis::pass::InputHintFact>,
+}
+
+fn materialize_msvc_classes(
+    arch: &kuna_decomp::architecture::Architecture,
+    mc: kuna_analysis::rtti::kuna_msvcclasses::MsvcClassRecoveryData,
+) -> MaterializedMsvcClasses {
+    use kuna_analysis::rtti::kuna_msvcclasses::{
+        FieldTypeHint, RecoveredFieldKind, RecoveredMethodKind,
+    };
+    use kuna_decomp::dtype::{type_metatype, Datatype, TypeField};
+
+    let types = arch.types();
+    let ptr_size = mc.ptr_size as int4;
+    let this_reg: &'static str = if mc.is_64 { "RCX" } else { "ECX" };
+    let has_thiscall = arch
+        .get_model("__thiscall")
+        .is_some_and(|m| m.get_alias_parent().is_none());
+    let thiscall_name: Option<&'static str> = if has_thiscall { Some("__thiscall") } else { None };
+
+    let Ok(void_ty) = types.get_type_void() else {
+        return MaterializedMsvcClasses {
+            typed_vftables: Vec::new(),
+            function_symbols: mc.function_symbols,
+            prototypes: Vec::new(),
+            models: Vec::new(),
+            input_hints: Vec::new(),
+        };
+    };
+    let Ok(void_ptr) = types.get_type_pointer(ptr_size, Rc::clone(&void_ty), 1) else {
+        return MaterializedMsvcClasses {
+            typed_vftables: Vec::new(),
+            function_symbols: mc.function_symbols,
+            prototypes: Vec::new(),
+            models: Vec::new(),
+            input_hints: Vec::new(),
+        };
+    };
+    let Ok(u32_ty) = types.get_base(4, type_metatype::TYPE_UINT) else {
+        return MaterializedMsvcClasses {
+            typed_vftables: Vec::new(),
+            function_symbols: mc.function_symbols,
+            prototypes: Vec::new(),
+            models: Vec::new(),
+            input_hints: Vec::new(),
+        };
+    };
+    let Ok(i32_ty) = types.get_base(4, type_metatype::TYPE_INT) else {
+        return MaterializedMsvcClasses {
+            typed_vftables: Vec::new(),
+            function_symbols: mc.function_symbols,
+            prototypes: Vec::new(),
+            models: Vec::new(),
+            input_hints: Vec::new(),
+        };
+    };
+    let Ok(vbptr_ty) = types.get_type_pointer(ptr_size, Rc::clone(&i32_ty), 1) else {
+        return MaterializedMsvcClasses {
+            typed_vftables: Vec::new(),
+            function_symbols: mc.function_symbols,
+            prototypes: Vec::new(),
+            models: Vec::new(),
+            input_hints: Vec::new(),
+        };
+    };
+    let Ok(anon_code_ptr) = types
+        .get_type_code()
+        .and_then(|c| types.get_type_pointer(ptr_size, c, 1))
+    else {
+        return MaterializedMsvcClasses {
+            typed_vftables: Vec::new(),
+            function_symbols: mc.function_symbols,
+            prototypes: Vec::new(),
+            models: Vec::new(),
+            input_hints: Vec::new(),
+        };
+    };
+
+    // 1. Forward-declare all class shells (preserving any already-complete PDB/DWARF structs).
+    let mut shells: Vec<Option<Rc<Datatype>>> = Vec::with_capacity(mc.classes.len());
+    let mut already_complete: Vec<bool> = vec![false; mc.classes.len()];
+    for (i, cls) in mc.classes.iter().enumerate() {
+        let existing = match types.find_by_name(&cls.name) {
+            Ok(Some(t)) if t.get_metatype() == type_metatype::TYPE_STRUCT => Some(t),
+            _ => None,
+        };
+        if let Some(t) = existing {
+            if !t.is_incomplete() {
+                already_complete[i] = true;
+                shells.push(Some(t));
+                continue;
+            }
+            shells.push(Some(t));
+        } else {
+            let shell = types
+                .kuna_declare_record(&cls.name, false)
+                .ok()
+                .filter(|t| t.get_metatype() == type_metatype::TYPE_STRUCT);
+            shells.push(shell);
+        }
+    }
+
+    // 2. Build and complete every `<Class>_vftable` struct.
+    let mut vft_types: HashMap<String, Rc<Datatype>> = HashMap::new();
+    let mut typed_vftables: Vec<kuna_analysis::pass::TypedDataFact> = Vec::new();
+    for cls in &mc.classes {
+        for vf in &cls.vftables {
+            if vf.slots.is_empty() {
+                continue;
+            }
+            if let Some(existing) = vft_types.get(&vf.struct_name) {
+                typed_vftables.push(kuna_analysis::pass::TypedDataFact {
+                    addr: vf.base_addr,
+                    name: vf.label.clone(),
+                    type_: Rc::clone(existing),
+                });
+                continue;
+            }
+            let vft_shell = match types.find_by_name(&vf.struct_name) {
+                Ok(Some(t)) if t.get_metatype() == type_metatype::TYPE_STRUCT && !t.is_incomplete() => {
+                    vft_types.insert(vf.struct_name.clone(), Rc::clone(&t));
+                    typed_vftables.push(kuna_analysis::pass::TypedDataFact {
+                        addr: vf.base_addr,
+                        name: vf.label.clone(),
+                        type_: t,
+                    });
+                    continue;
+                }
+                Ok(Some(t)) if t.get_metatype() == type_metatype::TYPE_STRUCT => Some(t),
+                _ => types
+                    .kuna_declare_record(&vf.struct_name, false)
+                    .ok()
+                    .filter(|t| t.get_metatype() == type_metatype::TYPE_STRUCT),
+            };
+            let Some(vft_shell) = vft_shell else {
+                continue;
+            };
+            let owner_ptr = vf
+                .owner_class_idx
+                .and_then(|idx| shells.get(idx).and_then(|s| s.as_ref()))
+                .and_then(|s| types.get_type_pointer(ptr_size, Rc::clone(s), 1).ok())
+                .unwrap_or_else(|| Rc::clone(&void_ptr));
+
+            let mut slot_fields: Vec<TypeField> = Vec::with_capacity(vf.slots.len());
+            for (i, slot) in vf.slots.iter().enumerate() {
+                let slot_ty = if slot.is_deleting_dtor {
+                    let pieces = kuna_decomp::fspec::PrototypePieces {
+                        name: String::new(),
+                        outtype: Some(Rc::clone(&void_ptr)),
+                        intypes: vec![Rc::clone(&owner_ptr), Rc::clone(&u32_ty)],
+                        innames: vec!["this".to_string(), "flags".to_string()],
+                        first_var_arg_slot: -1,
+                        output_storage: None,
+                        input_storage: Vec::new(),
+                        kuna_library_names: None,
+                    };
+                    let code_ty = match thiscall_name {
+                        Some(m) => types
+                            .get_type_code_proto_named(&pieces, m)
+                            .or_else(|_| types.get_type_code_proto(&pieces)),
+                        None => types.get_type_code_proto(&pieces),
+                    };
+                    code_ty
+                        .and_then(|c| types.get_type_pointer(ptr_size, c, 1))
+                        .unwrap_or_else(|_| Rc::clone(&anon_code_ptr))
+                } else {
+                    Rc::clone(&anon_code_ptr)
+                };
+                slot_fields.push(TypeField::new(
+                    i as int4,
+                    (i as int4) * ptr_size,
+                    slot.field_name.clone(),
+                    slot_ty,
+                ));
+            }
+            let vft_size = (vf.slots.len() as int4) * ptr_size;
+            let completed = types
+                .set_fields_struct_raw(&vft_shell, slot_fields, Vec::new(), vft_size, ptr_size, 0)
+                .unwrap_or(vft_shell);
+            vft_types.insert(vf.struct_name.clone(), Rc::clone(&completed));
+            typed_vftables.push(kuna_analysis::pass::TypedDataFact {
+                addr: vf.base_addr,
+                name: vf.label.clone(),
+                type_: completed,
+            });
+        }
+    }
+
+    // 3. Complete `<Class>` structs in base-first topological order.
+    let mut completed_classes: Vec<Option<Rc<Datatype>>> = vec![None; mc.classes.len()];
+    for (i, cls) in mc.classes.iter().enumerate() {
+        if already_complete[i] {
+            completed_classes[i] = shells[i].clone();
+            continue;
+        }
+        let Some(shell) = shells[i].as_ref() else {
+            continue;
+        };
+        let mut fields: Vec<TypeField> = Vec::with_capacity(cls.fields.len());
+        for (fid, f) in cls.fields.iter().enumerate() {
+            let fty: Option<Rc<Datatype>> = match &f.kind {
+                RecoveredFieldKind::VftablePtr { vftable_struct_name } => vft_types
+                    .get(vftable_struct_name)
+                    .and_then(|vt| types.get_type_pointer(ptr_size, Rc::clone(vt), 1).ok())
+                    .or_else(|| Some(Rc::clone(&void_ptr))),
+                RecoveredFieldKind::Vbptr => Some(Rc::clone(&vbptr_ty)),
+                RecoveredFieldKind::VtorDisp => Some(Rc::clone(&i32_ty)),
+                RecoveredFieldKind::BaseSubobject { base_class_idx } => {
+                    completed_classes.get(*base_class_idx).and_then(|c| c.clone())
+                }
+                RecoveredFieldKind::Primitive { width, hint } => match hint {
+                    FieldTypeHint::Float if *width == 4 || *width == 8 => {
+                        types.get_base(*width as int4, type_metatype::TYPE_FLOAT).ok()
+                    }
+                    FieldTypeHint::VoidPtr if *width as int4 == ptr_size => Some(Rc::clone(&void_ptr)),
+                    FieldTypeHint::Int => {
+                        types.get_base(*width as int4, type_metatype::TYPE_INT).ok()
+                    }
+                    _ => types.get_base(*width as int4, type_metatype::TYPE_UINT).ok(),
+                },
+            };
+            if let Some(ty) = fty {
+                fields.push(TypeField::new(fid as int4, f.offset as int4, f.name.clone(), ty));
+            }
+        }
+        let done = types
+            .set_fields_struct_raw(
+                shell,
+                fields,
+                Vec::new(),
+                cls.size as int4,
+                cls.align as int4,
+                0,
+            )
+            .unwrap_or_else(|_| Rc::clone(shell));
+        completed_classes[i] = Some(done);
+    }
+
+    // 4. Mint `C *` pointers from completed `<Class>` structs (never from incomplete shells).
+    let class_ptrs: Vec<Option<Rc<Datatype>>> = completed_classes
+        .iter()
+        .map(|opt| {
+            opt.as_ref()
+                .and_then(|c| types.get_type_pointer(ptr_size, Rc::clone(c), 1).ok())
+        })
+        .collect();
+
+    // 5. Emit exact prototypes for dtors / deleting dtors, plus __thiscall + InputHintFact
+    //    for ctors / virtual methods / thunks (names & types `this` without fixing extra arity!).
+    let mut prototypes = Vec::new();
+    let mut models = Vec::new();
+    let mut input_hints = Vec::new();
+
+    for m in mc.methods {
+        let Some(this_ptr) = class_ptrs.get(m.this_class_idx).and_then(|p| p.as_ref()) else {
+            continue;
+        };
+        match m.kind {
+            RecoveredMethodKind::Dtor => {
+                prototypes.push((
+                    m.addr,
+                    kuna_decomp::fspec::PrototypePieces {
+                        name: m.name,
+                        outtype: Some(Rc::clone(&void_ty)),
+                        intypes: vec![Rc::clone(this_ptr)],
+                        innames: vec!["this".to_string()],
+                        first_var_arg_slot: -1,
+                        output_storage: None,
+                        input_storage: Vec::new(),
+                        kuna_library_names: None,
+                    },
+                    thiscall_name,
+                ));
+            }
+            RecoveredMethodKind::DeletingDtor => {
+                prototypes.push((
+                    m.addr,
+                    kuna_decomp::fspec::PrototypePieces {
+                        name: m.name,
+                        outtype: Some(Rc::clone(this_ptr)),
+                        intypes: vec![Rc::clone(this_ptr), Rc::clone(&u32_ty)],
+                        innames: vec!["this".to_string(), "flags".to_string()],
+                        first_var_arg_slot: -1,
+                        output_storage: None,
+                        input_storage: Vec::new(),
+                        kuna_library_names: None,
+                    },
+                    thiscall_name,
+                ));
+            }
+            RecoveredMethodKind::Ctor
+            | RecoveredMethodKind::VirtualMethod
+            | RecoveredMethodKind::AdjustorThunk => {
+                if let Some(model_name) = thiscall_name {
+                    models.push(kuna_analysis::pass::ModelFact {
+                        func_addr: m.addr,
+                        model: model_name,
+                        leaf_stack_inputs: None,
+                        maybe_self: false,
+                    });
+                }
+                input_hints.push(kuna_analysis::pass::InputHintFact {
+                    func_addr: m.addr,
+                    reg: this_reg,
+                    name: "this".to_string(),
+                    type_: Some(Rc::clone(this_ptr)),
+                });
+            }
+        }
+    }
+
+    MaterializedMsvcClasses {
+        typed_vftables,
+        function_symbols: mc.function_symbols,
+        prototypes,
+        models,
+        input_hints,
+    }
+}
+
 fn commit_model_facts(
     prog: &mut ConsoleProgram,
     code_space: &Rc<AddrSpace>,
@@ -6078,6 +6439,45 @@ fn commit_analysis_output(
     } else {
         Vec::new()
     };
+    // 0d. (kuna `rtti` classes) Materialize MSVC class and vftable structs only when
+    //     gated ON, suppressing colliding untyped `SymKind::Data` vftables so arm 4b
+    //     installs the typed `<Class>_vftable` globals cleanly, and upgrading raw
+    //     slot-index names (`vfunc_0`) to recovered ctor/dtor/thunk names.
+    let msvc_materialized = if prog.arch().analysis_rtti.classes() {
+        out.msvc_classes
+            .take()
+            .map(|mc| materialize_msvc_classes(prog.arch(), mc))
+    } else {
+        out.msvc_classes = None;
+        None
+    };
+    let (msvc_class_protos, msvc_class_models, msvc_class_input_hints) =
+        if let Some(mat) = msvc_materialized {
+            let typed_addrs: std::collections::HashSet<u64> =
+                mat.typed_vftables.iter().map(|td| td.addr).collect();
+            if !typed_addrs.is_empty() {
+                out.symbols
+                    .retain(|s| !(s.kind == SymKind::Data && typed_addrs.contains(&s.addr)));
+                out.typed_data.extend(mat.typed_vftables);
+            }
+            if !mat.function_symbols.is_empty() {
+                let upgraded: HashMap<u64, &str> = mat
+                    .function_symbols
+                    .iter()
+                    .map(|s| (s.addr, s.name.as_str()))
+                    .collect();
+                out.symbols.retain(|s| {
+                    !(s.kind == SymKind::Function
+                        && upgraded.get(&s.addr).is_some_and(|new_name| {
+                            replaces_slot_name(new_name, s.name.rsplit_once("::").map_or(&s.name, |(_, b)| b))
+                        }))
+                });
+                out.symbols.extend(mat.function_symbols);
+            }
+            (mat.prototypes, mat.models, mat.input_hints)
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        };
     let out = out;
     let signature_names =
         kuna_signature_names::SignatureNames::collect(prog, &out, zero_size_data_names);
@@ -6514,6 +6914,8 @@ fn commit_analysis_output(
                     .cmp(&b.ranges.first())
                     .then(a.depth.cmp(&b.depth))
                     .then(a.inlinee_id.cmp(&b.inlinee_id))
+                    .then(a.ranges.cmp(&b.ranges))
+                    .then(a.inlinee_name.cmp(&b.inlinee_name))
             });
             sites.dedup();
         }
@@ -7022,6 +7424,24 @@ fn commit_analysis_output(
         }
     }
 
+    // 5b-. (kuna `rtti` classes) Exact prototypes for MSVC destructors and scalar/vector
+    //      deleting destructors, applied BEFORE `cppsig` (5b) and `pdb_prototypes` (5a')
+    //      so mangled/DWARF/PDB signatures always win when present.
+    for (addr, pieces, model) in msvc_class_protos {
+        let a = Address::new(Rc::clone(code_space), addr);
+        if let Some(name) = model {
+            if let Some(m) = prog
+                .arch()
+                .get_model(name)
+                .filter(|m| m.get_alias_parent().is_none())
+                .cloned()
+            {
+                prog.arch_mut().set_function_prototype_model_at(&a, m);
+            }
+        }
+        prog.arch_mut().set_function_prototype_pieces_at(&a, pieces);
+    }
+
     // 5b. (kuna `cppsig`) The DEMANGLED prototypes, bound by entry address like
     //     the DWARF ones below. Applied BEFORE them on purpose: a mangled symbol
     //     carries a DECLARATION (which can disagree with the code a compiler
@@ -7203,6 +7623,8 @@ fn commit_analysis_output(
     //     parameters, and those of every direct call to it, are recovered under
     //     that model.
     commit_model_facts(prog, code_space, &out.models);
+    commit_model_facts(prog, code_space, &msvc_class_models);
+    commit_input_hints(prog, code_space, &msvc_class_input_hints);
 
     // 7b. (kuna `swifttypes`) Register-pinned parameters: each resolved through
     //     the language's register table and parked on the function's entry in
@@ -7210,22 +7632,7 @@ fn commit_analysis_output(
     //     the function's own decompile with. A register the language does not
     //     define is a silent no-op, as for the tracked registers above.
     if prog.arch().analysis_swifttypes {
-        for fact in &out.swift_types.param_locks {
-            let Ok(loc) = prog.arch().get_register_varnode(fact.reg.as_bytes()) else {
-                continue;
-            };
-            let Some(space) = loc.space.clone() else { continue };
-            let piece = kuna_decomp::fspec::ParameterPieces {
-                addr: Address::new(space, loc.offset),
-                type_: Some(Rc::clone(&fact.type_)),
-                flags: kuna_decomp::fspec::parameter_pieces_flags::TYPELOCK
-                    | kuna_decomp::fspec::parameter_pieces_flags::NAMELOCK,
-            };
-            let entry = Address::new(Rc::clone(code_space), fact.func_addr);
-            let locks = prog.arch_mut().loader_param_locks.entry(entry).or_default();
-            locks.retain(|(i, _, _)| *i != fact.index);
-            locks.push((fact.index, fact.name.clone(), piece));
-        }
+        commit_param_locks(prog, code_space, &out.swift_types.param_locks);
         // (kuna `swiftcall`) Model-only bindings and the unlocked `self`
         // hints, the register again resolved through the language.
         commit_model_facts(prog, code_space, &out.swift_types.models);

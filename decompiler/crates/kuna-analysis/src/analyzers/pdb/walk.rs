@@ -384,7 +384,7 @@ fn walk_module_stream(
                     if !inlinee_name.is_empty() && !ranges.is_empty() {
                         inline_sites_out.push(InlineSiteFact {
                             caller_addr: proc.vma,
-                            inlinee_id: site.inlinee.0,
+                            inlinee_id: kuna_decomp::kuna_inlinesites::InlineeId::Pdb(site.inlinee.0),
                             inlinee_name,
                             depth,
                             ranges,

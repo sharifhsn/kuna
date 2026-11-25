@@ -14,8 +14,9 @@ inside the leaf, so `funcboundflow` truncates the leaf there and one case of the
 switch vanishes from the emitted C.
 
 Beside it sits the same leaf as a `static` function: an `S_LPROC32` record and
-no public, so nothing but the gap walk's interior entry represents its code and
-that entry must survive.  Three more public procedures hold entries their own
+no public. The matching module symbol supplies its name. In the unnamed
+variant its extent survives in the PDB but nothing admits its start, so the
+gap walk's interior entry must survive.  Three more public procedures hold entries their own
 flow never reaches: `handler_leaf` has a block after its last `ret` (where a
 jump-table case or an exception handler sits), `caller_leaf` only calls its
 inner routine, and `noreturn_leaf` puts its block after a call to `abort`.
@@ -300,8 +301,8 @@ def build_text():
     return bytes(t.buf), funcs, locals_, extra_publics
 
 
-def build_rdata(rdata_off):
-    rsds = b"RSDS" + GUID + struct.pack("<I", AGE) + PDB_NAME.encode() + b"\0"
+def build_rdata(rdata_off, guid=GUID, pdb_name=PDB_NAME):
+    rsds = b"RSDS" + guid + struct.pack("<I", AGE) + pdb_name.encode() + b"\0"
     dd_size = 28
     rec_rva = RDATA_RVA + dd_size
     rec_off = rdata_off + dd_size
@@ -331,9 +332,9 @@ def layout(text_len):
     return nsec, opt_size, headers_sz, text_off, rdata_off
 
 
-def build_pe(text):
+def build_pe(text, guid=GUID, pdb_name=PDB_NAME):
     nsec, opt_size, headers_sz, text_off, rdata_off = layout(len(text))
-    rdata, debug_dir = build_rdata(rdata_off)
+    rdata, debug_dir = build_rdata(rdata_off, guid, pdb_name)
     image_sz = RDATA_RVA + SECT_ALIGN
 
     dos = bytearray(0x40)
@@ -400,8 +401,8 @@ def symbol_records(funcs, extra_publics):
     return bytes(out)
 
 
-def info_stream():
-    return (struct.pack("<III", 20000404, 0, AGE) + GUID
+def info_stream(guid=GUID):
+    return (struct.pack("<III", 20000404, 0, AGE) + guid
             + struct.pack("<I", 0)                      # names buffer size
             + struct.pack("<IIII", 0, 1, 0, 0)          # hash table: size, cap, present, deleted
             + struct.pack("<I", 20140508))              # feature: VC140
@@ -477,11 +478,11 @@ def msf(streams, block=512):
     return bytes(image)
 
 
-def build_pdb(funcs, locals_, extra_publics, sechdrs, text_len):
+def build_pdb(funcs, locals_, extra_publics, sechdrs, text_len, guid=GUID):
     mod = module_stream(funcs, locals_)
     syms = symbol_records(funcs, extra_publics)
     MOD, SYMREC, SECHDR = 5, 6, 7
-    streams = [b"", info_stream(), type_stream(),
+    streams = [b"", info_stream(guid), type_stream(),
                dbi_stream(MOD, len(mod), SYMREC, SECHDR, text_len),
                type_stream(), module_stream_with_refs(mod), syms, sechdrs]
     return msf(streams)
@@ -490,13 +491,18 @@ def build_pdb(funcs, locals_, extra_publics, sechdrs, text_len):
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
     text, funcs, locals_, extra_publics = build_text()
-    pe, sechdrs = build_pe(text)
-    pdb = build_pdb(funcs, locals_, extra_publics, sechdrs, len(text))
-    for ext, blob in ((".exe", pe), (".pdb", pdb)):
-        out = os.path.join(here, BASENAME + ext)
-        with open(out, "wb") as f:
-            f.write(blob)
-        print(f"wrote {out} ({len(blob)} bytes)")
+    unnamed = [("" if name == "static_leaf" else name, rva, length)
+               for name, rva, length in locals_]
+    variants = [(BASENAME, GUID, locals_),
+                (BASENAME + "_unnamed", bytes.fromhex("4b554e41504442494e544552494f5232"), unnamed)]
+    for base, guid, records in variants:
+        pe, sechdrs = build_pe(text, guid, base + ".pdb")
+        pdb = build_pdb(funcs, records, extra_publics, sechdrs, len(text), guid)
+        for ext, blob in ((".exe", pe), (".pdb", pdb)):
+            out = os.path.join(here, base + ext)
+            with open(out, "wb") as f:
+                f.write(blob)
+            print(f"wrote {out} ({len(blob)} bytes)")
 
 
 if __name__ == "__main__":

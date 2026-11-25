@@ -1188,6 +1188,7 @@ dependencies = [
  "kuna-decomp",
  "object",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

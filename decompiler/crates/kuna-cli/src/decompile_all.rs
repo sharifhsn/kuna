@@ -1263,6 +1263,7 @@ pub fn run_functions(argv: &[String]) -> i32 {
                         limits.as_ref(),
                         &|address| prog.output_code_offset(address),
                         &crate::funcdecl::Declared::of(&prog),
+                        &prog.arch().inline_sites,
                     )
                 })
             } else {

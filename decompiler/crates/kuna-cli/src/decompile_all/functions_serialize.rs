@@ -1,9 +1,11 @@
 //! Serialize borrowed inventory records without building a second function list.
 //! JSON layout belongs to serde_json; the formatter adds ASCII-safe strings.
 
+use std::collections::BTreeMap;
 use std::io::{self, Write};
 
 use kuna_console::engine::FunctionEntry;
+use kuna_decomp::kuna_inlinesites::{InlineeId, ParkedInlineSite};
 use serde::ser::Error as _;
 use serde::{Serialize, Serializer};
 use serde_json::ser::{Formatter, PrettyFormatter};
@@ -21,6 +23,7 @@ pub(super) fn write(
     limits: Option<&Json>,
     display_address: &dyn Fn(u64) -> u64,
     declared: &Declared,
+    inline_sites: &BTreeMap<u64, Vec<ParkedInlineSite>>,
 ) -> io::Result<()> {
     let fid_databases = declared.fid_databases_field().map(|(_, value)| value);
     let document = Document {
@@ -34,6 +37,7 @@ pub(super) fn write(
             entries,
             display_address,
             declared,
+            inline_sites,
         },
         limits: limits.map(JsonView),
     };
@@ -66,6 +70,7 @@ struct Entries<'a> {
     entries: &'a [FunctionEntry],
     display_address: &'a dyn Fn(u64) -> u64,
     declared: &'a Declared,
+    inline_sites: &'a BTreeMap<u64, Vec<ParkedInlineSite>>,
 }
 
 impl Serialize for Entries<'_> {
@@ -84,6 +89,8 @@ impl Serialize for Entries<'_> {
                     offset_hex: format!("0x{:x}", location.offset),
                 }),
                 size: entry.size,
+                inline_sites: self.inline_sites.get(&entry.addr.get_offset())
+                    .map(|sites| sites.iter().map(InlineSite::from).collect()),
                 declared: self
                     .declared
                     .bytes_label(entry.addr.get_offset())
@@ -103,6 +110,35 @@ struct Entry<'a> {
     size: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     declared: Option<Marker<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inline_sites: Option<Vec<InlineSite<'a>>>,
+}
+
+#[derive(Serialize)]
+struct InlineSite<'a> {
+    source: &'static str,
+    id: String,
+    name: &'a str,
+    depth: u16,
+    ranges: Vec<[String; 2]>,
+}
+
+impl<'a> From<&'a ParkedInlineSite> for InlineSite<'a> {
+    fn from(site: &'a ParkedInlineSite) -> Self {
+        let (source, id) = match site.inlinee_id {
+            InlineeId::Pdb(id) => ("pdb", u64::from(id)),
+            InlineeId::Dwarf(id) => ("dwarf", id),
+        };
+        Self {
+            source,
+            id: format!("0x{id:x}"),
+            name: &site.inlinee_name,
+            depth: site.depth,
+            ranges: site.ranges.iter().map(|(start, end)| {
+                [format!("0x{start:x}"), format!("0x{end:x}")]
+            }).collect(),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -266,6 +302,7 @@ mod tests {
                         limits,
                         &display_address,
                         &declared,
+                        &BTreeMap::new(),
                     )
                     .unwrap();
                     let expected = super::super::functions_json(
@@ -324,6 +361,7 @@ mod tests {
                     None,
                     &|address| address,
                     &Declared::default(),
+                    &BTreeMap::new(),
                 );
                 assert_eq!(result.as_ref().unwrap_err().kind(), kind);
                 let status = super::super::finish_with_run_error(result, run_error);

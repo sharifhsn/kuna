@@ -4,6 +4,8 @@
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
+use crate::common::process::Capped;
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../..")
@@ -22,8 +24,8 @@ fn run_kuna(args: &[&str]) -> Output {
         .env_remove("kuna_pdb_path")
         .env_remove("KUNA_PDB_IGNORE_GUID")
         .args(args)
-        .output()
-        .expect("failed to spawn kuna")
+        .capped_output()
+        .expect("failed to run kuna")
 }
 
 fn scratch_dir(tag: &str) -> PathBuf {
@@ -31,6 +33,50 @@ fn scratch_dir(tag: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create scratch dir");
     dir
+}
+
+#[test]
+fn inventory_reports_only_compiler_attributed_inline_ranges() {
+    for (binary, source, first, end) in [
+        ("pdb_inline.exe", "pdb", 1, 12),
+        ("dwarf_inline", "dwarf", 0, 11),
+    ] {
+        let input = fixture(binary);
+        let path = input.to_str().unwrap();
+        let out = run_kuna(&["functions", path, "--json"]);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let entries = doc["functions"].as_array().unwrap();
+        let mut id = None;
+        for name in ["sample_left", "sample_right"] {
+            let row = entries.iter().find(|e| e["name"] == name).unwrap();
+            let base = row["address"].as_u64().unwrap();
+            let sites = row["inline_sites"].as_array().unwrap();
+            assert_eq!(sites.len(), 1);
+            let site = &sites[0];
+            assert_eq!(site["source"], source);
+            assert_eq!(site["name"], "scale_and_bias");
+            assert_eq!(site["depth"], 0);
+            assert_eq!(site["ranges"], serde_json::json!([
+                [format!("0x{:x}", base + first), format!("0x{:x}", base + end)]
+            ]));
+            if let Some(previous) = id.replace(site["id"].as_str().unwrap()) {
+                assert_eq!(previous, id.unwrap());
+            }
+        }
+
+        let off = run_kuna(&["functions", path, "--json", "--option", source, "off"]);
+        assert!(off.status.success());
+        let doc: serde_json::Value = serde_json::from_slice(&off.stdout).unwrap();
+        assert!(doc["functions"].as_array().unwrap().iter().all(|e| e.get("inline_sites").is_none()));
+    }
+}
+
+#[test]
+fn pdb_requires_a_path_before_the_next_flag() {
+    let out = run_kuna(&["functions", "--pdb", "--pdb-ignore-guid", "unused.exe"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--pdb requires a value"));
 }
 
 #[test]

@@ -49,6 +49,12 @@ f30f1efa5389fb85f6740e83c30783fb327e0383eb036bdb0389dfe80400000001d85bc38d4701c3
 </bytechunk>
 <symbol space="ram" offset="0x401000" name="reg"/>
 <symbol space="ram" offset="0x401024" name="helper"/>
+<!-- A balanced scratch allocation in the supplied region has two SP writes.
+     Synthesizing a normal call here used to invent a stack-address argument. -->
+<bytechunk space="ram" offset="0x402000">
+85f674144883ec1085ff74084883ec084883c4084883c410b817000000c3
+</bytechunk>
+<symbol space="ram" offset="0x402000" name="stack_region"/>
 </binaryimage>
 <script>
   <com>option warnstyle banner</com>
@@ -60,6 +66,10 @@ f30f1efa5389fb85f6740e83c30783fb327e0383eb036bdb0389dfe80400000001d85bc38d4701c3
   <com>lo fu reg</com>
   <com>decompile</com>
   <com>print C</com>
+  <com>option outline 0x402000:0x402004-0x402018</com>
+  <com>lo fu stack_region</com>
+  <com>decompile</com>
+  <com>print C</com>
   <com>quit</com>
 </script>
 <stringmatch name="outline-proto #1: OFF is the bug - the region is inline (pass 1 only)" min="1" max="1">v1 = a0 \+ 7;</stringmatch>
@@ -68,4 +78,6 @@ f30f1efa5389fb85f6740e83c30783fb327e0383eb036bdb0389dfe80400000001d85bc38d4701c3
 <stringmatch name="outline-proto #4: the call AFTER the region keeps exactly one argument in both passes - defect 1 gave it stack junk (off plus on = 2)" min="2" max="2">return helper\(a0\) \+ a0;</stringmatch>
 <stringmatch name="outline-proto #5: no raw stack pointer leaks into the C in either pass - defect 1 emitted `&amp;Stack...`" min="0" max="0">Stack[0-9a-f]{8}</stringmatch>
 <stringmatch name="outline-proto #6: no rsp-typed local is introduced in either pass - defect 1 emitted `// rsp`" min="0" max="0">// rsp</stringmatch>
+<stringmatch name="outline-proto #7: preserve the explicit region that writes the stack pointer" min="0" max="0">outlined_0x402004</stringmatch>
+<stringmatch name="outline-proto #8: the stack region function still returns its constant" min="1" max="1">return 0x17;</stringmatch>
 </decompilertest>

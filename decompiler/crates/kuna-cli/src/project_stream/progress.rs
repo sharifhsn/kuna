@@ -19,7 +19,7 @@ use kuna_console::engine::ConsoleProgram;
 use kuna_console::project::{AsmPhase, FuncResult, ReadmeFacts, StreamPhase};
 
 use super::{
-    create, index_line, write_atomic, Layout, StreamRun, CLOCK_GRANULARITY, INDEX_FILE,
+    create, index_line, write_final_index, Layout, StreamRun, CLOCK_GRANULARITY, INDEX_FILE,
     README_EVERY, STATUS_FILE, TICK,
 };
 use crate::decompile_all::{load_program, Args, DriverDefaults};
@@ -146,7 +146,7 @@ impl ProgressWatch<'_> {
         let lines: String = results
             .iter()
             .enumerate()
-            .map(|(k, r)| index_line(*seq + k, r, image_base, default_c_file.as_deref(), None))
+            .map(|(k, r)| index_line(*seq + k, r, image_base, self.export_opts, default_c_file.as_deref(), None))
             .collect();
         *seq += results.len();
         if let Err(e) = out.write_all(lines.as_bytes()) {
@@ -197,12 +197,15 @@ impl ExportWatch for ProgressWatch<'_> {
 
     fn decompiling(&self, prog: &ConsoleProgram, total: usize) -> Result<(), String> {
         self.image_base.store(prog.image_base(), Ordering::SeqCst);
-        let facts = ReadmeFacts::snapshot(
-            &self.layout.binary_path,
-            &self.layout.path_label,
-            &self.layout.file_name,
-            prog,
-        );
+        let facts = ReadmeFacts {
+            output: self.export_opts,
+            ..ReadmeFacts::snapshot(
+                &self.layout.binary_path,
+                &self.layout.path_label,
+                &self.layout.file_name,
+                prog,
+            )
+        };
         self.open_feed()?;
         let _gate = self.readme_gate.lock().unwrap_or_else(|e| e.into_inner());
         {
@@ -235,16 +238,12 @@ impl ExportWatch for ProgressWatch<'_> {
         c_bytes: u64,
     ) -> Result<Vec<(String, usize)>, String> {
         self.feed.lock().unwrap_or_else(|e| e.into_inner()).file = None;
-        let mut index = String::new();
-        for (seq, (r, span)) in results.iter().zip(spans.iter()).enumerate() {
-            index.push_str(&index_line(seq, r, image_base, span.c_file.as_deref(), span.span));
-        }
-        write_atomic(&out_dir.join(INDEX_FILE), index.as_bytes())?;
+        let index = write_final_index(out_dir, results, spans, image_base, self.export_opts)?;
         {
             let mut shared = self.run.lock();
             shared.status.c_bytes = c_bytes;
             shared.status.asm = AsmPhase::Complete;
         }
-        Ok(vec![(INDEX_FILE.to_string(), index.len())])
+        Ok(vec![index])
     }
 }

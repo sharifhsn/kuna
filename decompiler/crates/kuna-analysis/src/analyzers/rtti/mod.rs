@@ -62,6 +62,8 @@
 
 pub mod kuna_itaniumctors;
 pub mod kuna_itaniumrtti;
+pub mod kuna_msvcclasses;
+pub mod kuna_msvchierarchy;
 pub mod models;
 pub mod refkind;
 pub mod vftable;
@@ -71,32 +73,21 @@ use object::read::Object;
 use object::{BinaryFormat, FileKind};
 
 use crate::pass::{AnalysisCtx, AnalysisOutput, AnalysisPass, Phase, SymFact, SymKind};
-use crate::demangle::demangle_rtti_class_name;
-use models::{
-    read_base_class_array, BaseClassDescriptor, ClassHierarchyDescriptor, CompleteObjectLocator,
-    ImageBytes, TypeDescriptor,
+use kuna_msvchierarchy::{
+    attribute_vtable_slots, recover_msvc_hierarchy, short_class_name, MsvcHierarchy,
+    SlotAttribution,
 };
+#[cfg(test)]
+use kuna_msvchierarchy::{
+    find_type_descriptors, pick_common_type_info_vftable, recover_from_descriptors,
+};
+use models::ImageBytes;
+#[cfg(test)]
+use models::TypeDescriptor;
 use refkind::{End, RefKind};
-use kuna_decomp::kuna_fasthash::{FxHashMap, FxHashSet};
-use vftable::{walk_vftable, TextRanges};
+use vftable::TextRanges;
 
-/// The byte distance from a reference-to-a-`TypeDescriptor` back to the
-/// `CompleteObjectLocator` that names it: the COL's `pTypeDescriptor` field is at
-/// COL+12 (`signature u32`, `offset u32`, `cdOffset u32` precede it), so a word that
-/// references a TD is the COL's offset-12 field ⇒ `COL = ref − 12`. The same on both
-/// arches (the COL preamble is three `u32`s on x86 and x64 alike).
-const COL_TD_FIELD_OFFSET: u64 = 12;
-
-/// The minimum number of distinct `TypeDescriptor`s that must agree on a common
-/// `type_info`-vftable pointer for that pointer to be accepted as the real
-/// `type_info::vftable` (the §3.1 "≥ some hits agreeing" gate; Ghidra's
-/// `RttiAnalyzer` uses the most-referenced common pointer). Two suffices for a real
-/// polymorphic program (a base + a derived class); a coincidental pointer rarely has
-/// even one matching `.?A…@@` neighbor.
-const MIN_TYPE_INFO_AGREEMENT: usize = 2;
-
-/// The MSVC RTTI / vftable recovery pass (gate id `rtti`). Default-OFF, PE/MSVC path
-/// only.
+/// The MSVC RTTI / vftable recovery pass (gate id `rtti`). PE/MSVC path only.
 #[derive(Default)]
 pub struct RttiPass;
 
@@ -111,106 +102,80 @@ impl AnalysisPass for RttiPass {
 
     fn run(&self, ctx: &AnalysisCtx) -> AnalysisOutput {
         let mut out = AnalysisOutput::default();
-
-        // PE/MSVC gate (belt-and-suspenders on top of the passes_for registration
-        // gate): a non-PE image carries no MSVC RTTI.
         if ctx.file.format() != BinaryFormat::Pe {
             return out;
         }
-
         let Some(rk) = ref_kind_for(ctx) else {
             return out;
         };
         let img = ImageBytes::new(ctx.file);
-        // The executable-section ranges that bound a vftable's slot walk (R3): a slot
-        // is a virtual-method entry only while it points into one of these.
         let text = TextRanges::new(ctx.file);
-
-        // 1. Find the common `type_info` vftable: the pointer every RTTI0
-        //    TypeDescriptor's leading `pVFTable` field shares. We discover it by
-        //    locating the `.?A…@@` type-info name strings, reading the word
-        //    `name_offset` bytes before each (the TD base's pVFTable pointer), and
-        //    taking the value the most TypeDescriptors agree on.
-        let descriptors = find_type_descriptors(&img, &rk);
-        let Some(type_info_vftable) = pick_common_type_info_vftable(&descriptors) else {
-            return out;
-        };
-
-        // 2. Keep only the TypeDescriptors that point at the agreed type_info
-        //    vftable (a real RTTI0), de-duplicated by address.
-        let mut tds: Vec<&TypeDescriptor> = descriptors
-            .iter()
-            .filter(|td| td.p_vftable == type_info_vftable)
-            .collect();
-        tds.sort_by_key(|td| td.addr);
-        tds.dedup_by_key(|td| td.addr);
-
-        // 3. For each TypeDescriptor, find the CompleteObjectLocator that names it
-        //    and emit the class it validates.
-        emit_classes(&img, &rk, &text, &tds, &mut out);
-
+        let hier = recover_msvc_hierarchy(&img, &rk, &text);
+        emit_hierarchy(&hier, &rk, &mut out);
         out
     }
 }
 
-/// For each TypeDescriptor, take the image's references to it (`ref`), treat
-/// `ref − 12` as a candidate CompleteObjectLocator, and validate the
-/// COL→RTTI3→RTTI2→RTTI1→RTTI0 reachability chain. A validated COL yields the class
-/// name (and the names of every base class reachable through its hierarchy) + the
-/// vftable VA. Each byte-search is one scan of the image for every class at once:
-/// a scan per class is `O(classes × image)`, longer than any decompile on a large
-/// C++ DLL.
-fn emit_classes(
-    img: &ImageBytes,
-    rk: &RefKind,
-    text: &TextRanges,
-    tds: &[&TypeDescriptor],
-    out: &mut AnalysisOutput,
-) {
-    let refs = img.scan_refs(rk, &tds.iter().map(|td| td.addr).collect());
-    let mut seen_cols = FxHashSet::<u64>::default();
-    let mut cols = Vec::new();
-    for td in tds {
-        for &ref_vma in refs.get(&td.addr).map(Vec::as_slice).unwrap_or_default() {
-            let Some(col_addr) = ref_vma.checked_sub(COL_TD_FIELD_OFFSET) else {
-                continue;
-            };
-            if !seen_cols.insert(col_addr) {
-                continue;
-            }
-            let Some(col) = CompleteObjectLocator::read(img, rk, col_addr) else {
-                continue;
-            };
-            // The COL must name THIS TypeDescriptor (the ref we followed is its
-            // pTypeDescriptor field) and reach a valid class hierarchy.
-            if col.p_type_descriptor != td.addr {
-                continue;
-            }
-            cols.push(col);
+/// Emit RTTI labels, vftable labels, read-only ranges, and ancestor-attributed
+/// virtual-method slot symbols from a recovered [`MsvcHierarchy`].
+pub fn emit_hierarchy(hier: &MsvcHierarchy, rk: &RefKind, out: &mut AnalysisOutput) {
+    if hier.classes.is_empty() {
+        return;
+    }
+    for cls in &hier.classes {
+        out.symbols.push(SymFact {
+            addr: cls.td_addr,
+            name: format!("{}::RTTI_Type_Descriptor", cls.name),
+            kind: SymKind::Data,
+        });
+        for vf in &cls.vftables {
+            out.symbols.push(SymFact {
+                addr: vf.col.addr,
+                name: vf.col_label.clone(),
+                kind: SymKind::Data,
+            });
+            out.symbols.push(SymFact {
+                addr: vf.base,
+                name: vf.label.clone(),
+                kind: SymKind::Data,
+            });
+            out.readonly.push(vf.range(rk));
         }
     }
-    let mut meta_slots = FxHashMap::<u64, Vec<u64>>::default();
-    for (slot, col_addr) in img.scan_ptr_slots(rk, &cols.iter().map(|c| c.addr).collect()) {
-        meta_slots.entry(col_addr).or_default().push(slot);
-    }
-    for col in &cols {
-        let slots = meta_slots.get(&col.addr).map(Vec::as_slice).unwrap_or_default();
-        emit_for_col(img, rk, text, col, slots, out);
+
+    let slot_attr = attribute_vtable_slots(hier);
+    for (fn_addr, attr) in slot_attr {
+        let SlotAttribution::Unique { class_idx, vf_idx, slot_idx } = attr else {
+            continue;
+        };
+        let cls = &hier.classes[class_idx];
+        let vf = &cls.vftables[vf_idx];
+        let name = if vf.col.offset == 0 {
+            vfunc_name(&cls.name, slot_idx)
+        } else if let Some(bidx) = vf.owner_base_idx {
+            format!("{}::vfunc_for_{}_{slot_idx}", cls.name, short_class_name(&hier.classes[bidx].name))
+        } else {
+            vfunc_name(&cls.name, slot_idx)
+        };
+        out.symbols.push(SymFact {
+            addr: fn_addr,
+            name,
+            kind: SymKind::Function,
+        });
     }
 }
 
-/// Build the [`RefKind`] for a PE `ctx`: 64-bitness from the file, the image base
-/// from the typed PE optional header, endianness little (every PE arch kuna
-/// supports). `None` if the PE width/header is unparsable.
+/// Build the [`RefKind`] for a PE `ctx`.
 fn ref_kind_for(ctx: &AnalysisCtx) -> Option<RefKind> {
-    let is64 = ctx.file.is_64();
-    let image_base = pe_image_base(ctx.bytes)?;
+    ref_kind_for_raw(ctx.file, ctx.bytes)
+}
+
+pub(crate) fn ref_kind_for_raw(file: &object::File<'_>, bytes: &[u8]) -> Option<RefKind> {
+    let is64 = file.is_64();
+    let image_base = pe_image_base(bytes)?;
     Some(RefKind::new(is64, image_base, End::Little))
 }
 
-/// Read the PE `ImageBase` from the optional header via the typed `object` PE
-/// parser (the neutral `object::File` view does not expose it). `None` on a
-/// non-PE / unparsable image.
 fn pe_image_base(bytes: &[u8]) -> Option<u64> {
     match FileKind::parse(bytes).ok()? {
         FileKind::Pe64 => {
@@ -225,186 +190,25 @@ fn pe_image_base(bytes: &[u8]) -> Option<u64> {
     }
 }
 
-/// `relative_address_base()` = the optional-header `ImageBase` (the addend an x64
-/// `IBO32` displacement is relative to).
 fn image_base_of<Pe: ImageNtHeaders>(pe: &object::read::pe::PeFile<Pe>) -> u64 {
     pe.relative_address_base()
 }
 
-/// A candidate RTTI0 found by the `.?A…@@`-name scan: the decoded
-/// [`TypeDescriptor`] at the address `name_offset` bytes before a type-info name.
-fn find_type_descriptors(img: &ImageBytes, rk: &RefKind) -> Vec<TypeDescriptor> {
-    let mut out = Vec::new();
-    // Scan every section for `.?A` (the MSVC type-info name prefix); each occurrence
-    // is a candidate name string whose TypeDescriptor base sits `name_offset` bytes
-    // before it. `find_type_info_name_addrs` returns the VMAs of the `.` byte.
-    for name_addr in find_type_info_name_addrs(img) {
-        let Some(td_addr) = name_addr.checked_sub(rk.type_descriptor_name_offset()) else {
-            continue;
-        };
-        if let Some(td) = TypeDescriptor::read(img, rk, td_addr) {
-            // Sanity: the decoded name must START at the scanned `.?A` (read() reads
-            // the name at td_addr + name_offset == name_addr).
-            out.push(td);
-        }
-    }
-    out
-}
-
-/// Scan every loaded section for the start VMA of each `.?A`-prefixed,
-/// NUL-terminated ASCII string (the MSVC type-info name marker). Returns the VMA of
-/// the leading `.` byte.
-fn find_type_info_name_addrs(img: &ImageBytes) -> Vec<u64> {
-    img.scan_prefix(b".?A")
-}
-
-/// The most-agreed-upon `type_info`-vftable pointer among the candidate
-/// TypeDescriptors, or `None` if no pointer reaches [`MIN_TYPE_INFO_AGREEMENT`].
-fn pick_common_type_info_vftable(descriptors: &[TypeDescriptor]) -> Option<u64> {
-    use std::collections::HashMap;
-    let mut counts: HashMap<u64, usize> = HashMap::new();
-    for td in descriptors {
-        // A null pVFTable is never the type_info vftable.
-        if td.p_vftable != 0 {
-            *counts.entry(td.p_vftable).or_insert(0) += 1;
-        }
-    }
-    counts
-        .into_iter()
-        .filter(|&(_, n)| n >= MIN_TYPE_INFO_AGREEMENT)
-        // Highest agreement wins; ties broken by the lower VMA for determinism.
-        .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)))
-        .map(|(vma, _)| vma)
-}
-
-/// Validate the chain rooted at `col` and emit the class-name + label facts:
-///   - the COL's own class (its `pTypeDescriptor`), and
-///   - every base class reachable through RTTI3→RTTI2→RTTI1.
-/// Also labels the COL, each TypeDescriptor, and the recovered vftable.
-fn emit_for_col(
-    img: &ImageBytes,
-    rk: &RefKind,
-    text: &TextRanges,
-    col: &CompleteObjectLocator,
-    meta_slots: &[u64],
-    out: &mut AnalysisOutput,
-) {
-    // The COL's own class name (RTTI0 it points at).
-    let Some(self_td) = TypeDescriptor::read(img, rk, col.p_type_descriptor) else {
-        return;
-    };
-    let Some(self_class) = demangle_rtti_class_name(&self_td.mangled_name) else {
-        return;
-    };
-
-    // Validate + walk the hierarchy: RTTI3 → RTTI2 → each RTTI1 → its RTTI0. A COL
-    // whose hierarchy does not decode is rejected (a coincidental `ref−12` that is
-    // not really a COL). We REQUIRE the hierarchy to resolve so a false COL never
-    // emits a spurious class.
-    let Some(chd) = ClassHierarchyDescriptor::read(img, rk, col.p_class_hierarchy) else {
-        return;
-    };
-    let base_rtti1s = read_base_class_array(img, rk, chd.p_base_class_array, chd.num_base_classes);
-    if base_rtti1s.is_empty() {
-        return;
-    }
-
-    // Self class: label its TypeDescriptor + COL + vftable.
-    emit_type_descriptor_label(&self_class, self_td.addr, out);
-    out.symbols.push(SymFact {
-        addr: col.addr,
-        name: format!("{self_class}::RTTI_Complete_Object_Locator"),
-        kind: SymKind::Data,
-    });
-    if let Some(vftable_base) = recover_vftable(img, rk, meta_slots) {
-        out.symbols.push(SymFact {
-            addr: vftable_base,
-            name: format!("{self_class}::vftable"),
-            kind: SymKind::Data,
-        });
-        // R3: walk the vftable's slots, naming each virtual-method function
-        // `<Class>::vfunc_<i>` and marking the slot array read-only. The virtual
-        // dispatch (an unnamed `DAT_*` slot before) now resolves to a named function.
-        if let Some(vt) = walk_vftable(img, rk, text, vftable_base) {
-            emit_vftable_methods(&self_class, &vt, rk, out);
-        }
-    }
-
-    // Each base class reachable through the hierarchy: label its TypeDescriptor.
-    for r1_addr in base_rtti1s {
-        let Some(r1) = BaseClassDescriptor::read(img, rk, r1_addr) else {
-            continue;
-        };
-        let Some(base_td) = TypeDescriptor::read(img, rk, r1.p_type_descriptor) else {
-            continue;
-        };
-        if let Some(base_class) = demangle_rtti_class_name(&base_td.mangled_name) {
-            emit_type_descriptor_label(&base_class, base_td.addr, out);
-        }
-    }
-}
-
-/// Emit the `<Class>::RTTI_Type_Descriptor` Data label for a TypeDescriptor.
-fn emit_type_descriptor_label(class: &str, td_addr: u64, out: &mut AnalysisOutput) {
-    out.symbols.push(SymFact {
-        addr: td_addr,
-        name: format!("{class}::RTTI_Type_Descriptor"),
-        kind: SymKind::Data,
-    });
-}
-
-/// The name a recovered virtual method takes: `<Class>::vfunc_<i>` for slot `i` of the
-/// class's vftable. Deliberately NOT `<Class>::vftable_<i>` — that spells the data
-/// object, and a class under multiple inheritance genuinely owns several vftables, so
-/// the indexed form reads as "vftable number i" rather than "the function in slot i".
 fn vfunc_name(class: &str, slot: usize) -> String {
     format!("{class}::vfunc_{slot}")
 }
 
-/// Emit the per-slot virtual-method facts for a recovered vftable (R3):
-///   - one `Function` [`SymFact`] per slot, named [`vfunc_name`] at the slot's
-///     target VA (the virtual method the dispatch jumps to);
-///   - the slot array's VMA range as read-only ([`AnalysisOutput::readonly`]).
-/// The `SymFact{Function}` commit is an idempotent ADD (`find_function`-gated), so a
-/// slot target that already carries a real `.symtab`/import name keeps it; only a
-/// never-symboled virtual method takes the `<Class>::vfunc_<i>` name.
-fn emit_vftable_methods(
-    class: &str,
-    vt: &vftable::VfTable,
+#[cfg(test)]
+fn emit_classes(
+    img: &ImageBytes,
     rk: &RefKind,
+    text: &TextRanges,
+    tds: &[&TypeDescriptor],
     out: &mut AnalysisOutput,
 ) {
-    for (i, &fn_addr) in vt.slots.iter().enumerate() {
-        out.symbols.push(SymFact {
-            addr: fn_addr,
-            name: vfunc_name(class, i),
-            kind: SymKind::Function,
-        });
-    }
-    // The slot array itself is constant data — mark it read-only so a load of a vtable
-    // slot can fold (the `out.readonly` commit arm ORs `Varnode::readonly` over it).
-    out.readonly.push(vt.range(rk));
-}
-
-/// Recover the class's vftable VMA from a validated COL: a vftable's `meta` slot
-/// (the pointer-width word immediately *before* the vftable) holds the COL's VA, so
-/// the vftable starts at `meta_slot + ptr_size`. `meta_slots` are the full-pointer
-/// slots holding the COL's address, in image order; the word AFTER one is the
-/// vftable base.
-fn recover_vftable(img: &ImageBytes, rk: &RefKind, meta_slots: &[u64]) -> Option<u64> {
-    let ptr = rk.ptr_size() as u64;
-    for &slot in meta_slots {
-        let vftable = slot + ptr;
-        // The vftable's first slot should be a plausible pointer (into a loaded
-        // section — a virtual-method entry). A weak but effective guard.
-        if let Some(first) = img.read(vftable, rk.ptr_size()) {
-            let first_ptr = rk.read_ptr(first);
-            if first_ptr != 0 && img.contains(first_ptr) {
-                return Some(vftable);
-            }
-        }
-    }
-    None
+    let owned: Vec<TypeDescriptor> = tds.iter().map(|t| (*t).clone()).collect();
+    let hier = recover_from_descriptors(img, rk, text, &owned);
+    emit_hierarchy(&hier, rk, out);
 }
 
 #[cfg(test)]

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use crate::project_db::{ProjectDbReader, ProjectDbWriter, DB_FILE};
 use crate::project_shards::{
-    func_rel_path, rva_bucket, slab_rel_path, OutputLayout, ShardWriter, DEFAULT_SHARD_ALIGN,
+    func_dir, func_rel_path, rva_bucket, slab_rel_path, OutputLayout, ShardWriter, DEFAULT_SHARD_ALIGN,
 };
 
 const DEFAULT_N: usize = 300_000;
@@ -175,7 +175,7 @@ fn bench_single(n: usize) -> BenchRow {
             c_out.write_all(block.as_bytes()).unwrap();
             let line = format!(
                 "{{\"seq\":{i},\"name\":\"{name}\",\"addr\":\"0x{va:x}\",\"rva\":\"0x{rva:x}\",\
-                 \"end_rva\":\"0x{:x}\",\"size\":256,\"c_file\":\"app.exe.c\",\
+                 \"end_rva\":\"0x{:x}\",\"shard\":null,\"size\":256,\"c_file\":\"app.exe.c\",\
                  \"c_offset\":{pos},\"c_len\":{},\"error\":null}}\n",
                 rva + FUNC_STRIDE,
                 block.len()
@@ -379,7 +379,7 @@ fn bench_rva_file(n: usize) -> BenchRow {
         let start_bucket = rva_bucket(0x1000 + (idx as u64) * FUNC_STRIDE, DEFAULT_SHARD_ALIGN);
         let read_bucket = |b: u64| -> usize {
             let mut sum = 0usize;
-            let bdir = dir.path().join(format!("funcs/rva_{b:08x}"));
+            let bdir = dir.path().join(func_dir(b));
             if let Ok(rd) = std::fs::read_dir(&bdir) {
                 for e in rd.flatten() {
                     if let Ok(bytes) = std::fs::read(e.path()) {

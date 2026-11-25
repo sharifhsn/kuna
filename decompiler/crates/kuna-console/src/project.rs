@@ -19,6 +19,9 @@
 //! `kuna-cli`); everything here operates on an already-loaded
 //! [`ConsoleProgram`] and the resolved [`FunctionEntry`] target list.
 
+pub mod layout;
+
+use layout::{OutputLayout, ProjectExportOpts};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::Path;
@@ -2843,18 +2846,20 @@ pub struct ReadmeSectionRow {
     pub kind: String,
 }
 
-/// Everything the README says about the binary, as plain owned data.
-///
-/// Snapshotted from the `ConsoleProgram` on the thread that owns it
-/// ([`Self::snapshot`]), so a streamed export can keep rewriting its README from
-/// a writer thread that never sees the program.
 /// Compute the relative virtual address (RVA) of `vma` against `image_base`.
 pub fn rva_of(vma: u64, image_base: u64) -> u64 {
     vma.checked_sub(image_base).unwrap_or(vma)
 }
 
+/// Everything the README says about the binary, as plain owned data.
+///
+/// Snapshotted from the `ConsoleProgram` on the thread that owns it
+/// ([`Self::snapshot`]), so a streamed export can keep rewriting its README from
+/// a writer thread that never sees the program.
 #[derive(Debug, Clone, Default)]
 pub struct ReadmeFacts {
+    /// Files selected for this export. The browser uses the single-file defaults.
+    pub output: ProjectExportOpts,
     /// The path string printed in the `| Path |` row (the CLI passes the
     /// canonicalized on-disk path; the wasm front-end a virtual name).
     pub path_label: String,
@@ -2879,6 +2884,7 @@ impl ReadmeFacts {
     /// The facts known before the program is loaded: the path and its size.
     pub fn pending(binary_path: &Path, path_label: &str, file_name: &str) -> Self {
         Self {
+            output: ProjectExportOpts::default(),
             path_label: path_label.to_string(),
             file_name: file_name.to_string(),
             file_size: std::fs::metadata(binary_path).map(|m| m.len()).ok(),
@@ -3077,7 +3083,7 @@ pub fn render_readme_streaming(
          final; files are appended / rewritten while it does.",
     );
     let mut out = render_readme_inner(facts, progress.counts(), layout, banner);
-    out.push_str(&render_streaming_status(progress));
+    out.push_str(&render_streaming_status(progress, facts.output.no_asm));
     out.push_str(&render_streaming_caveats(facts, layout));
     out
 }
@@ -3098,7 +3104,7 @@ fn render_readme_stillborn(facts: &ReadmeFacts, progress: &StreamProgress) -> St
         "| File size | {} bytes |\n",
         facts.file_size.map_or_else(|| "?".to_string(), |size| size.to_string())
     ));
-    out.push_str(&render_streaming_status(progress));
+    out.push_str(&render_streaming_status(progress, facts.output.no_asm));
     out
 }
 
@@ -3162,6 +3168,10 @@ fn render_readme_inner(
     }
 
     out.push_str("\n## Files\n\n");
+    if facts.output.layout != OutputLayout::Single || facts.output.no_asm {
+        render_layout_files(&mut out, facts, layout);
+        return out;
+    }
     match layout {
         ReadmeLayout::Standard | ReadmeLayout::Progress => out.push_str(&format!(
             "- `{file_name}.c` — every decompiled function, address-ordered, each under a\n\
@@ -3251,7 +3261,49 @@ fn render_readme_inner(
     out
 }
 
-fn render_streaming_status(progress: &StreamProgress) -> String {
+fn render_layout_files(out: &mut String, facts: &ReadmeFacts, schedule: ReadmeLayout) {
+    let name = &facts.file_name;
+    let output = facts.output;
+    match output.layout {
+        OutputLayout::Single => out.push_str(&format!("- `{name}.c` contains the function bodies.\n")),
+        OutputLayout::RvaSlab | OutputLayout::Both => {
+            out.push_str("- `src/` contains C files grouped by relative virtual address.\n");
+        }
+        OutputLayout::RvaFile => {
+            out.push_str("- `funcs/` contains one C file per function, grouped by relative virtual address.\n");
+        }
+        OutputLayout::Turso => {}
+    }
+    if output.layout.writes_shards() {
+        out.push_str(&format!(
+            "- `shards.json` lists the address buckets, their paths and their function counts. The bucket size is `0x{:x}` bytes.\n",
+            output.shard_align
+        ));
+    }
+    if output.layout.writes_turso() {
+        out.push_str("- `functions.db` holds the function bodies and metadata. Run `kuna query . --json` in this folder for its metadata and counts.\n");
+    }
+    out.push_str(&format!("- `{name}.h` contains the type definitions and function prototypes.\n"));
+    if !output.no_asm {
+        out.push_str(&format!("- `{name}.asm` contains the labeled disassembly.\n"));
+    }
+    if output.layout != OutputLayout::Single || schedule != ReadmeLayout::Standard {
+        out.push_str("- `index.jsonl` lists each function's name, address and RVA extent.");
+        if output.layout != OutputLayout::Single {
+            out.push_str(" The `shard` field gives its aligned RVA bucket.");
+        }
+        if output.layout == OutputLayout::Turso {
+            out.push_str(" Use the RVA to read its body from the database.\n");
+        } else {
+            out.push_str(" The final `c_file`, `c_offset` and `c_len` locate its bytes.\n");
+        }
+    }
+    if schedule != ReadmeLayout::Standard {
+        out.push_str("- `.streaming` records progress during the export and the error if it fails.\n");
+    }
+}
+
+fn render_streaming_status(progress: &StreamProgress, no_asm: bool) -> String {
     let mut out = String::from("\n## Streaming status\n\n| Field | Value |\n|---|---|\n");
     out.push_str(&format!("| Phase | {} |\n", progress.phase.as_str()));
     out.push_str(&format!("| Elapsed | {}s |\n", progress.elapsed_s));
@@ -3263,7 +3315,9 @@ fn render_streaming_status(progress: &StreamProgress) -> String {
         )),
         None => out.push_str("| Functions written | pending |\n"),
     }
-    out.push_str(&format!("| Disassembly | {} |\n", progress.asm.as_str()));
+    if !no_asm {
+        out.push_str(&format!("| Disassembly | {} |\n", progress.asm.as_str()));
+    }
     if let Some(error) = &progress.error {
         out.push_str(&format!("| Error | {error} |\n"));
     }
@@ -3275,6 +3329,12 @@ fn render_streaming_status(progress: &StreamProgress) -> String {
 fn render_streaming_caveats(facts: &ReadmeFacts, layout: ReadmeLayout) -> String {
     let file_name = &facts.file_name;
     let mut out = String::new();
+    if facts.output.layout != OutputLayout::Single || facts.output.no_asm {
+        return match layout {
+            ReadmeLayout::Progress => String::from("\nDuring export, `index.jsonl` reports completed functions. Final paths and byte offsets are available when the export finishes.\n"),
+            _ => String::from("\nDuring export, read complete newline-terminated records from `index.jsonl`. The final header and any database indexes are available when the export finishes.\n"),
+        };
+    }
     if layout == ReadmeLayout::Progress {
         out.push_str(&format!(
             "\nWhile `.streaming` exists the export is incomplete:\n\n\

@@ -7,82 +7,10 @@ use std::path::{Path, PathBuf};
 
 use crate::jsonfmt::{dumps_indent2, Json};
 
-pub const DEFAULT_SHARD_ALIGN: u64 = 0x10000;
+pub use kuna_console::project::layout::{OutputLayout, ProjectExportOpts, DEFAULT_SHARD_ALIGN};
 pub const MAX_OPEN_SHARD_FDS: usize = 64;
 const SLAB_BUF_BYTES: usize = 16 * 1024;
 pub const SHARDS_MANIFEST: &str = "shards.json";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum OutputLayout {
-    #[default]
-    Single,
-    RvaSlab,
-    RvaFile,
-    Turso,
-    Both,
-}
-
-impl OutputLayout {
-    pub fn parse(raw: &str) -> Result<Self, String> {
-        match raw {
-            "single" => Ok(Self::Single),
-            "rva-slab" => Ok(Self::RvaSlab),
-            "rva-file" => Ok(Self::RvaFile),
-            "turso" => Ok(Self::Turso),
-            "both" => Ok(Self::Both),
-            _ => Err(format!(
-                "invalid --layout {raw:?}; expected single, rva-slab, rva-file, turso, or both"
-            )),
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Single => "single",
-            Self::RvaSlab => "rva-slab",
-            Self::RvaFile => "rva-file",
-            Self::Turso => "turso",
-            Self::Both => "both",
-        }
-    }
-
-    pub fn writes_single_c(self) -> bool {
-        matches!(self, Self::Single)
-    }
-
-    pub fn writes_slabs(self) -> bool {
-        matches!(self, Self::RvaSlab | Self::Both)
-    }
-
-    pub fn writes_per_file(self) -> bool {
-        matches!(self, Self::RvaFile)
-    }
-
-    pub fn writes_shards(self) -> bool {
-        self.writes_slabs() || self.writes_per_file()
-    }
-
-    pub fn writes_turso(self) -> bool {
-        matches!(self, Self::Turso | Self::Both)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ProjectExportOpts {
-    pub layout: OutputLayout,
-    pub shard_align: u64,
-    pub no_asm: bool,
-}
-
-impl Default for ProjectExportOpts {
-    fn default() -> Self {
-        Self {
-            layout: OutputLayout::Single,
-            shard_align: DEFAULT_SHARD_ALIGN,
-            no_asm: false,
-        }
-    }
-}
 
 pub fn parse_shard_align(raw: &str) -> Result<u64, String> {
     let trimmed = raw.trim();
@@ -107,11 +35,15 @@ pub fn rva_bucket(rva: u64, shard_align: u64) -> u64 {
 }
 
 pub fn slab_rel_path(bucket: u64) -> String {
-    format!("slabs/rva_{bucket:08x}.c")
+    format!("src/rva_{bucket:08x}.c")
+}
+
+pub fn func_dir(bucket: u64) -> String {
+    format!("funcs/0x{bucket:08x}")
 }
 
 pub fn func_rel_path(bucket: u64, rva: u64) -> String {
-    format!("funcs/rva_{bucket:08x}/0x{rva:08x}.c")
+    format!("{}/0x{rva:08x}.c", func_dir(bucket))
 }
 
 #[derive(Debug, Clone)]
@@ -185,7 +117,7 @@ impl ShardWriter {
         max_open_fds: usize,
     ) -> Result<Self, String> {
         if layout.writes_slabs() {
-            let slabs_dir = out_dir.join("slabs");
+            let slabs_dir = out_dir.join("src");
             std::fs::create_dir_all(&slabs_dir)
                 .map_err(|e| format!("cannot create {}: {e}", slabs_dir.display()))?;
         }
@@ -324,7 +256,7 @@ impl ShardWriter {
         block: &str,
     ) -> Result<WriteReceipt, String> {
         if self.created_dirs.insert(bucket) {
-            let bucket_dir = self.out_dir.join(format!("funcs/rva_{bucket:08x}"));
+            let bucket_dir = self.out_dir.join(func_dir(bucket));
             std::fs::create_dir_all(&bucket_dir)
                 .map_err(|e| format!("cannot create {}: {e}", bucket_dir.display()))?;
         }
@@ -356,7 +288,7 @@ impl ShardWriter {
         };
 
         let meta = self.slabs.entry(bucket).or_insert_with(|| SlabMeta {
-            rel_path: format!("funcs/rva_{bucket:08x}"),
+            rel_path: func_dir(bucket),
             bytes: 0,
             func_count: 0,
             min_rva: rva,
@@ -481,7 +413,7 @@ mod tests {
         .unwrap();
         let block = "// Function: main @ 0x140012340\nint main(void) { return 0; }\n\n";
         let receipt = writer.write_func(0x12340, 0x12380, block).unwrap();
-        assert_eq!(receipt.rel_path, "funcs/rva_00010000/0x00012340.c");
+        assert_eq!(receipt.rel_path, "funcs/0x00010000/0x00012340.c");
         let summary = writer.finalize().unwrap();
         assert_eq!(summary.shard_count, 1);
         let content = std::fs::read_to_string(dir.path().join(&receipt.rel_path)).unwrap();

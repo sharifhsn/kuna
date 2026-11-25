@@ -57,9 +57,9 @@ use std::path::{Path, PathBuf};
 
 use kuna_console::engine::ConsoleProgram;
 use kuna_console::project::{
-    build_asm, build_header, build_readme, collect_dat_addrs,
+    build_asm, build_header, collect_dat_addrs,
     decompile_export_targets_with_options, export_options, render_c, rva_of, BatchOutcome,
-    FuncResult,
+    render_readme, FuncResult, ReadmeCounts, ReadmeFacts, ReadmeLayout,
 };
 use kuna_decomp::decompile_drive::{print_c_recompile_prelude, print_c_types};
 
@@ -231,8 +231,8 @@ fn usage() {
          \x20 README.md   binary metadata (size, arch, image base, entry, sections, counts)\n\
          --layout controls how function C bodies are stored (default: single):\n\
          \x20 single      one monolithic <name>.c (default)\n\
-         \x20 rva-slab    memory-aligned RVA slab files under slabs/rva_<bucket>.c + shards.json\n\
-         \x20 rva-file    one file per function under funcs/rva_<bucket>/0x<rva>.c + shards.json\n\
+         \x20 rva-slab    memory-aligned RVA slab files under src/rva_<bucket>.c + shards.json\n\
+         \x20 rva-file    one file per function under funcs/0x<bucket>/0x<rva>.c + shards.json\n\
          \x20 turso       embedded SQLite-compatible functions.db (query with `kuna query`)\n\
          \x20 both        both rva-slab and functions.db\n\
          --shard-align sets the power-of-two RVA bucket granularity (default 0x10000 = 64 KiB).\n\
@@ -426,7 +426,16 @@ pub(crate) fn decompile_project(
     // The CLI's `| Path |` row prints the canonicalized on-disk path (the wasm
     // front-end passes a virtual label instead), so output stays byte-identical.
     let path_label = binary_path.display().to_string();
-    let readme = build_readme(&binary_path, &path_label, &file_name, &prog, &results);
+    let facts = ReadmeFacts {
+        output: export_opts,
+        ..ReadmeFacts::snapshot(&binary_path, &path_label, &file_name, &prog)
+    };
+    let schedule = if watch.is_some() && (export_opts.no_asm || export_opts.layout != OutputLayout::Single) {
+        ReadmeLayout::Progress
+    } else {
+        ReadmeLayout::Standard
+    };
+    let readme = render_readme(&facts, Some(ReadmeCounts::of(&results)), schedule);
 
     std::fs::create_dir_all(&out_dir)
         .map_err(|e| format!("cannot create {}: {e}", out_dir.display()))?;
@@ -538,6 +547,10 @@ pub(crate) fn decompile_project(
 
     if let Some(watch) = watch {
         sizes.extend(watch.written(&out_dir, image_base, &results, &spans, total_c_bytes)?);
+    } else if export_opts.layout != OutputLayout::Single {
+        sizes.push(crate::project_stream::write_final_index(
+            &out_dir, &results, &spans, image_base, export_opts,
+        )?);
     }
 
     let ok = results.iter().filter(|r| r.error.is_none()).count();

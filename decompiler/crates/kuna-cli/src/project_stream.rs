@@ -62,7 +62,7 @@ use crate::jobs::{self, ChunkSource, TargetSpec};
 use crate::jsonfmt::{dumps_compact, Json};
 use crate::project_db::{ProjectDbWriter, DB_FILE};
 use crate::project_shards::{
-    OutputLayout, ProjectExportOpts, ShardSummary, ShardWriter, SHARDS_MANIFEST,
+    rva_bucket, OutputLayout, ProjectExportOpts, ShardSummary, ShardWriter, SHARDS_MANIFEST,
 };
 
 /// The status file, present only while an export is running.
@@ -774,7 +774,7 @@ impl ProjectWriter {
         if !self.export_opts.no_asm {
             self.dat.extend(collect_dat_addrs(std::slice::from_ref(&r)));
         }
-        let line = index_line(self.seq, &r, self.image_base, c_file.as_deref(), span);
+        let line = index_line(self.seq, &r, self.image_base, self.export_opts, c_file.as_deref(), span);
         self.index
             .write_all(line.as_bytes())
             .map_err(|e| format!("cannot append to {INDEX_FILE}: {e}"))?;
@@ -867,6 +867,7 @@ fn index_line(
     seq: usize,
     r: &FuncResult,
     image_base: u64,
+    opts: ProjectExportOpts,
     c_file: Option<&str>,
     span: Option<(u64, usize)>,
 ) -> String {
@@ -883,6 +884,11 @@ fn index_line(
         ("addr".into(), Json::Str(format!("0x{:x}", r.address))),
         ("rva".into(), Json::Str(format!("0x{rva:x}"))),
         ("end_rva".into(), Json::Str(format!("0x{end_rva:x}"))),
+        ("shard".into(), if opts.layout == OutputLayout::Single {
+            Json::Null
+        } else {
+            Json::Str(format!("0x{:08x}", rva_bucket(rva, opts.shard_align)))
+        }),
         ("size".into(), Json::Number(r.size.to_string())),
         ("c_file".into(), c_file.map_or(Json::Null, |f| Json::Str(f.to_string()))),
         ("c_offset".into(), offset),
@@ -890,6 +896,35 @@ fn index_line(
         ("error".into(), r.error.clone().map_or(Json::Null, Json::Str)),
     ]);
     format!("{}\n", dumps_compact(&line))
+}
+
+/// Publish the final index atomically after the files it describes are flushed.
+/// Buffer one row at a time so a large project does not require a second copy.
+pub(crate) fn write_final_index(
+    dir: &Path,
+    results: &[FuncResult],
+    spans: &[crate::decompile_project::WrittenSpan],
+    image_base: u64,
+    opts: ProjectExportOpts,
+) -> Result<(String, usize), String> {
+    if results.len() != spans.len() {
+        return Err(format!("cannot publish {INDEX_FILE}: a function is missing its output record"));
+    }
+    let path = dir.join(INDEX_FILE);
+    let failed = |err: std::io::Error| format!("cannot write {}: {err}", path.display());
+    let mut staged = tempfile::NamedTempFile::new_in(dir).map_err(failed)?;
+    let mut size = 0;
+    {
+        let mut writer = std::io::BufWriter::new(staged.as_file_mut());
+        for (seq, (result, span)) in results.iter().zip(spans).enumerate() {
+            let row = index_line(seq, result, image_base, opts, span.c_file.as_deref(), span.span);
+            writer.write_all(row.as_bytes()).map_err(failed)?;
+            size += row.len();
+        }
+        writer.flush().map_err(failed)?;
+    }
+    staged.persist(&path).map_err(|err| failed(err.error))?;
+    Ok((INDEX_FILE.to_string(), size))
 }
 
 // --- the export --------------------------------------------------------------
@@ -912,7 +947,10 @@ pub(crate) fn run(
     let run = StreamRun::new(
         layout.out_dir.clone(),
         mode.readme(),
-        ReadmeFacts::pending(&layout.binary_path, &layout.path_label, &layout.file_name),
+        ReadmeFacts {
+            output: export_opts,
+            ..ReadmeFacts::pending(&layout.binary_path, &layout.path_label, &layout.file_name)
+        },
         args.jobs.max(1),
     );
 
@@ -1028,12 +1066,10 @@ fn export(
     )?;
     {
         let mut shared = run.lock();
-        shared.facts = ReadmeFacts::snapshot(
-            &layout.binary_path,
-            &layout.path_label,
-            &layout.file_name,
-            &prog,
-        );
+        shared.facts = ReadmeFacts {
+            output: export_opts,
+            ..ReadmeFacts::snapshot(&layout.binary_path, &layout.path_label, &layout.file_name, &prog)
+        };
         shared.status.phase = StreamPhase::Decompiling;
         shared.status.total = Some(targets.len());
         shared.status.seeds = seeds.len();
@@ -2013,7 +2049,7 @@ mod tests {
         let prelude = "#include \"x.h\"\n\n";
         let c = format!("{prelude}{block}");
         let offset = prelude.len();
-        let line = index_line(0, &ok, 0x400000, Some("x.c"), Some((offset as u64, block.len())));
+        let line = index_line(0, &ok, 0x400000, ProjectExportOpts::default(), Some("x.c"), Some((offset as u64, block.len())));
         assert!(line.ends_with('\n'));
         assert!(line.contains("\"seq\":0"));
         assert!(line.contains("\"addr\":\"0x401000\""));
@@ -2027,9 +2063,9 @@ mod tests {
         let mut bad = ok;
         bad.code = None;
         bad.error = Some("budget exceeded".into());
-        assert!(index_line(1, &bad, 0x400000, Some("x.c"), Some((0, 0))).contains("\"error\":\"budget exceeded\""));
+        assert!(index_line(1, &bad, 0x400000, ProjectExportOpts::default(), Some("x.c"), Some((0, 0))).contains("\"error\":\"budget exceeded\""));
 
-        let feed = index_line(2, &bad, 0x400000, Some("x.c"), None);
+        let feed = index_line(2, &bad, 0x400000, ProjectExportOpts::default(), Some("x.c"), None);
         assert!(feed.contains("\"c_offset\":null,\"c_len\":null"), "{feed}");
     }
 }

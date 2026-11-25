@@ -941,22 +941,23 @@ mod tests {
             .unwrap();
         let binary = root.join("decompiler/crates/kuna-analysis/tests/fixtures/pdb_prog.exe");
         let specs = root.join("specs");
-        let result = super::run_with_mode(
-            binary.to_str().unwrap(),
-            specs.to_str().unwrap(),
-            "project",
-            Some("pdb_prog.exe"),
-            Some("fast"),
-        );
-        let json = result.expect("WASM fast project");
-        assert!(
-            json.contains("@ 0x140001000"),
-            "hidden direct callee missing: {json}"
-        );
-        assert!(
-            json.contains("return a1 * 7 + a0 * 3;"),
-            "hidden direct callee has no real body: {json}"
-        );
+        let isolated = tempfile::tempdir().expect("scratch image without symbols");
+        let bare = isolated.path().join("pdb_prog.exe");
+        std::fs::copy(&binary, &bare).expect("copy PE without its sidecar");
+        for (input, expected) in [
+            (&bare, "return a1 * 7 + a0 * 3;"),
+            (&binary, "return b * 7 + a * 3;"),
+        ] {
+            let result = super::run_with_mode(
+                input.to_str().unwrap(), specs.to_str().unwrap(),
+                "project", Some("pdb_prog.exe"), Some("fast"),
+            ).expect("WASM fast project");
+            let project: serde_json::Value = serde_json::from_str(&result).unwrap();
+            let code = project["files"]["pdb_prog.exe.c"].as_str().unwrap();
+            assert!(code.contains("@ 0x140001000"), "direct callee missing: {code}");
+            assert!(code.contains(expected), "direct callee has no real body: {code}");
+            assert_eq!(code.contains("pdb_demo_compute"), input == &binary);
+        }
     }
 
     /// Direct browser decompilation uses body-bearing selection too; inventory

@@ -35,11 +35,9 @@
 //!    across chained records, and the procedure is the authority on where that
 //!    function ends; and
 //! 3. a function is committed at `start` ([`suppress_owned_interior_entries`],
-//!    checked at the commit). The `pdb` pass names functions from the publics,
-//!    and a `static` function has an `S_LPROC32` record but no public: 756 of the
-//!    3,268 procedures in each testbed image. Dropping an entry inside one of
-//!    those whose start nothing else admits would leave its code with no function
-//!    at all, so such a procedure is left alone.
+//!    checked at the commit). A named local procedure can supply this entry
+//!    without a public symbol. An unnamed procedure can supply an extent
+//!    while its start is still unknown. In that case the gap-walk entry stays.
 //!
 //! ## Which entries inside it are dropped
 //!

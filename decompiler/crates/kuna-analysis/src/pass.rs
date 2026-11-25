@@ -774,6 +774,8 @@ pub struct AnalysisOutput {
     pub pdb_prototypes: Vec<(u64, kuna_decomp::fspec::PrototypePieces, Option<&'static str>)>,
     /// (kuna `pdb`) Inline call-site records recovered from `S_INLINESITE`/`S_INLINESITE2`.
     pub inline_sites: Vec<InlineSiteFact>,
+    /// (kuna `rtti`) Deferred MSVC C++ class recovery facts materialized at commit.
+    pub msvc_classes: Option<crate::rtti::kuna_msvcclasses::MsvcClassRecoveryData>,
 }
 
 impl AnalysisOutput {
@@ -836,6 +838,15 @@ impl AnalysisOutput {
         self.format_sites.iter_mut().for_each(|f| fix_proto(&mut f.pieces));
         self.pdb_prototypes.iter_mut().for_each(|(_, p, _)| fix_proto(p));
         self.inline_sites.iter_mut().for_each(|s| fix(&mut s.inlinee_name));
+        if let Some(mc) = &mut self.msvc_classes {
+            mc.function_symbols.iter_mut().for_each(|s| fix(&mut s.name));
+            mc.methods.iter_mut().for_each(|m| fix(&mut m.name));
+            for cls in &mut mc.classes {
+                for vf in &mut cls.vftables {
+                    fix_data(&mut vf.label);
+                }
+            }
+        }
         let helpers = &mut self.swift_helpers;
         helpers.symbols.iter_mut().for_each(|s| {
             if s.kind == SymKind::Data { fix_data(&mut s.name); } else { fix(&mut s.name); }
@@ -987,6 +998,9 @@ impl AnalysisOutput {
         self.format_sites.extend(other.format_sites);
         self.pdb_prototypes.extend(other.pdb_prototypes);
         self.inline_sites.extend(other.inline_sites);
+        if other.msvc_classes.is_some() {
+            self.msvc_classes = other.msvc_classes;
+        }
         self.libctypes_glibc |= other.libctypes_glibc;
         self.libctypes_refused |= other.libctypes_refused;
         if other.arm_frames.is_some() {
@@ -995,14 +1009,13 @@ impl AnalysisOutput {
     }
 }
 
-/// (kuna `pdb`) One inlined callee instance inside a caller function,
-/// recovered from PDB `S_INLINESITE`/`S_INLINESITE2` + `ModuleInfo::inlinees()`.
+/// One compiler-attributed inlined callee instance inside a caller function.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InlineSiteFact {
     /// Entry VMA of the enclosing caller function.
     pub caller_addr: u64,
-    /// Raw IPI `IdIndex` of the inlinee.
-    pub inlinee_id: u32,
+    /// Identity of the inlinee in the source PDB or DWARF information.
+    pub inlinee_id: kuna_decomp::kuna_inlinesites::InlineeId,
     /// Normalized name of the inlined function or method.
     pub inlinee_name: String,
     /// Inline nesting depth inside the caller (`0` for top-level inline sites).
