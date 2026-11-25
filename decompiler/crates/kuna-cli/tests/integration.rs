@@ -43,6 +43,9 @@ mod ambiguous_selector_cli;
 #[path = "declared_bytes_cli.rs"]
 mod declared_bytes_cli;
 
+#[path = "scale_bounds_cli.rs"]
+mod scale_bounds_cli;
+
 #[path = "argument_errors_cli.rs"]
 mod argument_errors_cli;
 

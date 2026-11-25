@@ -87,6 +87,9 @@ mod verify_buildstamp;
 #[path = "verify_lazyfuncs.rs"]
 mod verify_lazyfuncs;
 
+#[path = "verify_scale_bounds.rs"]
+mod verify_scale_bounds;
+
 #[path = "verify_byteoverlay.rs"]
 mod verify_byteoverlay;
 

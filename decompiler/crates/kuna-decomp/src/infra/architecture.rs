@@ -1803,6 +1803,8 @@ pub struct Architecture {
     pub analysis_fast_funcdisc: bool,
     /// (kuna `lazyfuncs`) Commit discovered entries as names only; default off.
     pub analysis_lazyfuncs: bool,
+    /// (kuna `pdataonly`) Treat PE64 `.pdata` as authoritative for entries and extents; default off.
+    pub analysis_pdataonly: bool,
     /// (kuna `lazyfuncs`) Entry starts the commit installed as NAMES only, sorted, so
     /// flow reads a branch to one as a transfer, not code to follow into.
     pub lazy_entry_starts: Rc<Vec<u64>>,
@@ -2739,6 +2741,7 @@ impl Architecture {
             analysis_listing: false,
             analysis_fast_funcdisc: false,
             analysis_lazyfuncs: false,
+            analysis_pdataonly: false,
             lazy_entry_starts: Rc::default(),
             analysis_noreturn_disc: false,
             analysis_noreturn_propagate: false,
@@ -3114,6 +3117,7 @@ impl Architecture {
         self.analysis_listing = false; // Listing/xref tier default-off
         self.analysis_fast_funcdisc = false; // bounded whole-project discovery default-off
         self.analysis_lazyfuncs = false;
+        self.analysis_pdataonly = false;
         self.lazy_entry_starts = Rc::default();
         self.analysis_noreturn_disc = true; // (kuna) DIV-22 default-on: Ghidra's FindNoReturnFunctionsAnalyzer ≥3-evidence discovered-no-return (default-on in Ghidra). REMOVES CODE (marks a callee no-return from ≥3 dead-fall-through sites → drops post-call dead code at callers). Gated on the Listing (default-off), so every parity gate is byte-identical (real-ELF Listing path only); restore with `option noreturn_disc off`
         self.analysis_noreturn_propagate = true; // (kuna) DIV-14 default-on: REMOVES CODE (call-graph no-return propagation drops post-call dead code). Gated on the Listing (default-off), so every parity gate is byte-identical (real-ELF Listing path only); restore with `option noreturn_propagate off`

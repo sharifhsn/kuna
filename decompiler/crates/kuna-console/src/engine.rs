@@ -136,6 +136,17 @@ fn next_revision() -> u64 {
     NEXT_REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+fn parse_sub_placeholder(name: &str) -> Option<u64> {
+    let hex = name.strip_prefix("sub_")?;
+    if hex.is_empty()
+        || (hex.len() > 1 && hex.starts_with('0'))
+        || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return None;
+    }
+    u64::from_str_radix(hex, 16).ok()
+}
+
 impl SymbolStream {
     fn from_loader(records: Vec<ProgramSymbol>) -> Self {
         let mut stream = Self::default();
@@ -679,6 +690,8 @@ pub struct ConsoleProgram {
     /// Non-zero sizes only: a bare declaration with no extent leaves the entry
     /// unbounded, which is the engine-wide `UNBOUNDED_SIZE` default.
     declared_extents: BTreeMap<u64, int4>,
+    pdata_extents: BTreeMap<u64, int4>,
+    declared_max_size: u64,
     /// (kuna) **Caller-declared function entries**, entry VMA — every address a
     /// caller asserted a function at through `function bounds` /
     /// `--define-function`, extent or no extent.
@@ -2539,24 +2552,37 @@ impl ConsoleProgram {
     pub fn declare_extent(&mut self, vma: u64, size: int4) {
         self.callwide_changed();
         self.declared_revision = next_revision();
+        self.record_declared_extent_raw(vma, size);
+    }
+
+    fn record_declared_extent_raw(&mut self, vma: u64, size: int4) {
+        self.pdata_extents.remove(&vma);
         if size > 0 {
             self.declared_extents.insert(vma, size);
-        } else {
-            self.declared_extents.remove(&vma);
+            self.declared_max_size = self.declared_max_size.max(size as u64);
+        } else if let Some(old) = self.declared_extents.remove(&vma) {
+            if old as u64 == self.declared_max_size {
+                self.declared_max_size =
+                    self.declared_extents.values().map(|&s| s as u64).max().unwrap_or(0);
+            }
         }
     }
 
-    /// The caller-declared byte extent of the function entered at `vma`, or
-    /// [`UNBOUNDED_SIZE`] when none was declared — the value every load of that
-    /// entry passes as the analysis-size bound.
+    /// The caller-declared (or `.pdata`-authoritative) byte extent of the
+    /// function entered at `vma`, or [`UNBOUNDED_SIZE`] when none was declared
+    /// — the value every load of that entry passes as the analysis-size bound.
     pub fn declared_extent(&self, vma: u64) -> int4 {
-        self.declared_extents.get(&vma).copied().unwrap_or(UNBOUNDED_SIZE)
+        self.declared_extents
+            .get(&vma)
+            .or_else(|| self.pdata_extents.get(&vma))
+            .copied()
+            .unwrap_or(UNBOUNDED_SIZE)
     }
 
     /// Is any function extent declared for this program?  Cheap enough to gate a
     /// per-entry lookup in the inventory bulk pass.
     pub fn has_declared_extents(&self) -> bool {
-        !self.declared_extents.is_empty()
+        !self.declared_extents.is_empty() || !self.pdata_extents.is_empty()
     }
 
     /// Did a caller assert a function at `vma` (`function bounds` /
@@ -2604,9 +2630,11 @@ impl ConsoleProgram {
     /// caller over the loader's symbol table. Entries discovery added are not
     /// declarations.
     pub(crate) fn function_declarer(&self, vma: u64, pending: Option<PendingFunction>) -> Option<Declarer> {
-        if pending.is_some_and(|p| p.entry == vma)
-            || self.declared_entries.iter().any(|&entry| self.isa_bit_cleared(entry) == vma)
-        {
+        let mask = self.isa_mask();
+        let caller_declared = (vma & mask == vma)
+            && (self.declared_entries.contains(&vma)
+                || (mask != !0 && self.declared_entries.contains(&(vma | 1))));
+        if pending.is_some_and(|p| p.entry == vma) || caller_declared {
             Some(Declarer::Caller)
         } else {
             self.loader_function_entries.binary_search(&vma).is_ok().then_some(Declarer::Loader)
@@ -2618,8 +2646,8 @@ impl ConsoleProgram {
     /// extent replaces the symbol table's size; an entry with neither has no
     /// known extent.
     ///
-    /// The symbol table's sizes are sorted by entry, so only the entries
-    /// within the largest size below `vma` are visited.
+    /// Both the symbol table's sizes and caller-declared entries are bounded by
+    /// the largest known function size below `vma`.
     pub(crate) fn functions_holding(&self, vma: u64, pending: Option<PendingFunction>) -> Vec<(u64, u64, Declarer)> {
         let mask = self.isa_mask();
         let caller_extent = |entry: u64| match pending.filter(|p| p.entry == entry) {
@@ -2635,10 +2663,15 @@ impl ConsoleProgram {
             let at = sizes.partition_point(|&(at, _)| at & mask < entry);
             sizes.get(at).filter(|&&(at, _)| at & mask == entry).map(|&(_, size)| size)
         };
-        let declared = self
-            .declared_entries
-            .iter()
-            .map(|&entry| entry & mask)
+        let max_span = self.declared_max_size.max(self.loader_max_size);
+        let declared_window = (max_span > 0).then(|| {
+            let lo = vma.saturating_sub(max_span) & mask;
+            let hi = vma | !mask;
+            self.declared_entries.range(lo..=hi).map(move |&entry| entry & mask)
+        });
+        let declared = declared_window
+            .into_iter()
+            .flatten()
             .chain(pending.map(|p| p.entry))
             .filter_map(|entry| match caller_extent(entry) {
                 Some(size) => Some((entry, size, Declarer::Caller)),
@@ -2871,6 +2904,180 @@ impl ConsoleProgram {
             self.seed_declared_libc_prototype(&name, &addr);
         }
         Ok(name)
+    }
+
+    /// Batch form of [`Self::declare_function`]: applies all caller-declared
+    /// function boundaries in a single pass with O(N) anonymous-entry cleanup
+    /// and a single cache/revision invalidation.
+    pub fn declare_functions(
+        &mut self,
+        decls: &[(Address, Option<&str>, int4)],
+    ) -> KunaResult<()> {
+        if decls.is_empty() {
+            return Ok(());
+        }
+        let _load = self.arch().load_scope();
+        let type_code = self.arch().types().get_type_code()?;
+        let min_size = self.arch().min_funcsymbol_size;
+        let num_spaces = self.arch().manage().num_spaces() as int4;
+        let lazy_funcs = self.arch().analysis_lazyfuncs;
+        let name_style_angr = self.arch().name_style_angr;
+        let has_jump_targets = !self.arch().stated_jump_targets.is_empty();
+        let measurer = crate::kuna_declaredbytes::BatchMeasurer::new(self);
+        let mut named_placeholders: std::collections::HashSet<u64> = if lazy_funcs {
+            self.symbols
+                .iter()
+                .filter_map(|s| parse_sub_placeholder(&s.name))
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+        let mut removed_anon: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut new_anon_entries: Vec<(u64, u64)> = Vec::new();
+        let mut new_lazy_starts: Vec<u64> = Vec::new();
+
+        for (raw_addr, raw_name, size) in decls {
+            let size = *size;
+            let addr = match raw_addr.get_space() {
+                Some(space) => Address::new(
+                    std::rc::Rc::clone(space),
+                    self.thumb_normalized(raw_addr.get_offset()),
+                ),
+                None => raw_addr.clone(),
+            };
+            let vma = addr.get_offset();
+            if has_jump_targets {
+                let pending = PendingFunction {
+                    entry: self.isa_bit_cleared(vma),
+                    size: u64::try_from(size).ok().filter(|&s| s > 0),
+                };
+                crate::jump_targets::require_declaration_keeps_cases(self, pending).map_err(
+                    |reason| {
+                        KunaError::lowlevel(format!(
+                            "cannot declare a function at {:#x}: {reason}",
+                            self.output_code_offset(pending.entry)
+                        ))
+                    },
+                )?;
+            }
+            let explicit = raw_name.filter(|n| !n.is_empty());
+            let is_lazy_unnamed = lazy_funcs
+                && explicit.is_none()
+                && name_style_angr
+                && !named_placeholders.contains(&vma)
+                && addr.get_space().is_some()
+                && self.arch().symboltab.find_function_across_scopes(&addr).is_none();
+
+            if is_lazy_unnamed {
+                new_lazy_starts.push(vma);
+                new_anon_entries.push((vma, next_revision()));
+                self.record_declared_extent_raw(vma, size);
+                self.declared_entries.insert(vma);
+                let extent = u64::try_from(size).unwrap_or(0);
+                let bytes = measurer.measure(self, vma, extent);
+                let decl_name = if bytes == crate::kuna_declaredbytes::DeclaredBytes::Mapped {
+                    String::new()
+                } else {
+                    format!("sub_{vma:x}")
+                };
+                self.declared_bytes.insert(
+                    vma,
+                    crate::kuna_declaredbytes::Declaration { name: decl_name, size: extent, bytes },
+                );
+                continue;
+            }
+
+            let name = match explicit {
+                Some(n) => n.to_string(),
+                None => self.arch().name_function(&addr),
+            };
+            let arch = self.arch_mut();
+            let (scope, basename) =
+                arch.symboltab.find_create_scope_from_symbol_name(&name, "::", None, num_spaces)?;
+            let name = match arch.symboltab.find_function_across_scopes(&addr) {
+                Some((sym, _)) => match explicit {
+                    Some(_) => {
+                        arch.symboltab.rename_symbol(sym, &basename)?;
+                        install_named_call_fixup(arch, sym, &basename);
+                        name
+                    }
+                    None => arch.symboltab.symbol(sym).get_display_name().to_string(),
+                },
+                None => {
+                    let sym = arch.symboltab.add_function(
+                        scope,
+                        &addr,
+                        &basename,
+                        min_size,
+                        type_code.clone(),
+                    )?;
+                    if explicit.is_some() {
+                        install_named_call_fixup(arch, sym, &basename);
+                    }
+                    name
+                }
+            };
+            if let Some(anon_vma) = parse_sub_placeholder(&name) {
+                removed_anon.insert(anon_vma);
+                if lazy_funcs {
+                    named_placeholders.insert(anon_vma);
+                }
+            }
+            let bounded = kuna_decomp::kuna_symbolnamebound::bound_scope_path(&name, "::");
+            let prior = self.symbols.lookup_at(&bounded, &addr).map(|s| s.provenance);
+            self.symbols.remove_name(&bounded);
+            let object_location = self.object_location_at(vma);
+            self.symbols.push(ProgramSymbol {
+                ordinal: 0,
+                name: bounded.into_owned(),
+                addr: addr.clone(),
+                provenance: prior.unwrap_or(if object_location.is_some() {
+                    EntryProvenance::DefinedObject
+                } else {
+                    EntryProvenance::Mapped
+                }),
+                object_location,
+                binding: None,
+            });
+            self.record_declared_extent_raw(vma, size);
+            self.declared_entries.insert(vma);
+            let extent = u64::try_from(size).unwrap_or(0);
+            let bytes = measurer.measure(self, vma, extent);
+            let decl_name = if bytes == crate::kuna_declaredbytes::DeclaredBytes::Mapped {
+                String::new()
+            } else {
+                name.clone()
+            };
+            self.declared_bytes.insert(
+                vma,
+                crate::kuna_declaredbytes::Declaration { name: decl_name, size: extent, bytes },
+            );
+            if explicit.is_some() {
+                self.declared_names.insert(vma, name.clone());
+                self.seed_declared_libc_prototype(&name, &addr);
+            }
+        }
+
+        if !removed_anon.is_empty() {
+            self.anonymous_entries.retain(|&(vma, _)| !removed_anon.contains(&vma));
+            new_anon_entries.retain(|&(vma, _)| !removed_anon.contains(&vma));
+        }
+        if !new_anon_entries.is_empty() {
+            self.anonymous_entries.extend(new_anon_entries);
+            self.anonymous_entries
+                .sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+            self.anonymous_entries.dedup_by_key(|entry| entry.0);
+        }
+        if !new_lazy_starts.is_empty() {
+            let mut starts: Vec<u64> = self.arch().lazy_entry_starts.as_ref().clone();
+            starts.extend(new_lazy_starts);
+            self.arch_mut().set_lazy_entry_starts(starts);
+        }
+        self.anonymous_symbols.take();
+        self.symbols.revision = next_revision();
+        self.declared_revision = next_revision();
+        self.callwide_changed();
+        Ok(())
     }
 
     /// Ensure a `FunctionSymbol` exists at `addr` without asserting that the
@@ -3248,6 +3455,11 @@ impl ConsoleProgram {
                     .then_some(addr.get_offset())
             }));
         }
+        let pdata_only_active = self.arch().analysis_pdataonly
+            && self
+                .analysis_image
+                .as_ref()
+                .is_some_and(|(_, bytes, _)| kuna_analysis::entry::has_pe64_pdata(bytes));
         // Filter by the per-pass enable flags (default-on, set by the user's
         // `--option <id> on|off`), then merge the survivors in pass order.
         let mut merged = kuna_analysis::pass::AnalysisOutput::default();
@@ -3256,6 +3468,9 @@ impl ConsoleProgram {
         for (id, out) in pending {
             if id == "input_isa" {
                 input_context_paints.extend(out.context_paints);
+                continue;
+            }
+            if pdata_only_active && id == "entry_disc" {
                 continue;
             }
             if analysis_pass_enabled(self.arch(), id) {
@@ -3270,7 +3485,7 @@ impl ConsoleProgram {
         // Real-object path only (the XML path stashes no image). The stash is consumed
         // once and shared by both deferred passes.
         let want_listing = self.arch().analysis_listing;
-        let want_fast_funcdisc = self.arch().analysis_fast_funcdisc;
+        let want_fast_funcdisc = self.arch().analysis_fast_funcdisc && !pdata_only_active;
         let want_operand_refs = self.arch().analysis_operand_refs;
         let want_wide32_alone = self.arch().analysis_widestrings32 && !want_operand_refs;
         // (kuna) The full byte-pattern entry sweep is deferred here too — not
@@ -3279,6 +3494,30 @@ impl ConsoleProgram {
         // the gate was off (the default). See `passes::run_deferred_entry_passes`.
         if self.analysis_image.is_some() {
             if let Some((path, bytes, import_proofs)) = self.analysis_image.take() {
+                if pdata_only_active {
+                    if self.arch().analysis_entry_disc {
+                        if let Ok(file) = kuna_analysis::loadimage_object::parse_object(&bytes) {
+                            merged.entries.extend(
+                                kuna_analysis::entry::collect_pe64_pdata_only_entries(
+                                    &file,
+                                    &bytes,
+                                    Some(self.arch().get_description()),
+                                ),
+                            );
+                        }
+                    }
+                    self.pdata_extents.clear();
+                    for (begin, end) in kuna_analysis::entry::pe64_pdata_extents(&bytes) {
+                        if let Ok(size) = int4::try_from(end.saturating_sub(begin)) {
+                            if size > 0 {
+                                self.pdata_extents.insert(begin, size);
+                            }
+                        }
+                    }
+                    if !self.pdata_extents.is_empty() {
+                        self.declared_revision = next_revision();
+                    }
+                }
                 let profile_request = if rust_profile_request.is_some() {
                     match RustProfileReport::reject_unsupported(&bytes) {
                         Some(report) => {
@@ -3308,7 +3547,10 @@ impl ConsoleProgram {
                             &bytes,
                             arch,
                             image_path,
-                            &|id| analysis_pass_enabled(arch, id),
+                            &|id| {
+                                (!pdata_only_active || id != "funcstart_patterns")
+                                    && analysis_pass_enabled(arch, id)
+                            },
                         );
                         for (_, out) in entry_out {
                             merged.merge(out);
@@ -3374,6 +3616,21 @@ impl ConsoleProgram {
                         for (id, mut out) in consumer_out {
                             if let Some(record) = out.arm_frames.take() {
                                 self.arm_frames = Some(record);
+                            }
+                            if pdata_only_active
+                                && matches!(
+                                    id,
+                                    "fast_funcdisc"
+                                        | "aif"
+                                        | "ptrentry"
+                                        | "funcstart_patterns"
+                                        | "funcdisc_recursive"
+                                        | "poolentry"
+                                        | "tailcallentry"
+                                        | "calltable"
+                                )
+                            {
+                                continue;
                             }
                             if analysis_pass_enabled(self.arch(), id) {
                                 merged.merge(out);
@@ -4560,6 +4817,8 @@ fn empty_program(
         flow_ends: None,
         data_name_aliases: HashMap::new(),
         declared_extents: BTreeMap::new(),
+        pdata_extents: BTreeMap::new(),
+        declared_max_size: 0,
         declared_entries: BTreeSet::new(),
         loader_function_entries: Vec::new(),
         loader_split_parts: Vec::new(),

@@ -611,6 +611,23 @@ fn listing_seeds_for_language(
     seeds
 }
 
+fn listing_seeds_pdata_only(
+    file: &object::File,
+    bytes: &[u8],
+    language: Option<&str>,
+) -> Vec<u64> {
+    let execs = crate::entry::executable_sections(file);
+    let entries = crate::entry::collect_pe64_pdata_only_entries(file, bytes, language);
+    let mut seeds: Vec<u64> = crate::entry::existing_function_addrs(file, bytes)
+        .into_iter()
+        .chain(entries)
+        .filter(|&vma| crate::entry::in_executable_section(&execs, vma))
+        .collect();
+    seeds.sort_unstable();
+    seeds.dedup();
+    seeds
+}
+
 /// The **deferred entry-discovery** passes — kept OUT of [`passes_for`] for the
 /// same reason as [`listing_consumer_passes`]: their `--option <id> on|off` gate
 /// is set by the CLI *after* `load file`, so running them at load pays their full
@@ -857,14 +874,27 @@ pub fn run_listing_consumers_replaying_observed(
     if crate::loader::reloc_object::is_synthetically_laid_out(&file) {
         return Vec::new();
     }
-    let mut seeds = listing_seeds_for_language(&file, bytes, Some(arch.get_description()));
+    let pdata_only = arch.analysis_pdataonly && crate::entry::has_pe64_pdata(bytes);
+    let allow_fast_funcdisc = arch.analysis_fast_funcdisc && !pdata_only;
+    let allow_funcstart_patterns = arch.analysis_funcstart_patterns && !pdata_only;
+    let allow_addrtakenentry = arch.analysis_addrtakenentry && !pdata_only;
+    let allow_aif = arch.analysis_aif.enabled() && !pdata_only;
+    let allow_ptrentry = arch.analysis_ptrentry && !pdata_only;
+    let allow_tailcallentry = arch.analysis_tailcallentry && !pdata_only;
+    let allow_calltable = arch.analysis_calltable && !pdata_only;
+
+    let mut seeds = if pdata_only {
+        listing_seeds_pdata_only(&file, bytes, Some(arch.get_description()))
+    } else {
+        listing_seeds_for_language(&file, bytes, Some(arch.get_description()))
+    };
     let mut vouched: std::collections::BTreeSet<u64> = seeds.iter().copied().collect();
     vouched.extend(cold_entries.iter().copied());
     // (kuna) The fast inventory walk leaves out the functions a Go pclntab
     // names, where the `gopclntab` pass ran and commits them: the pass set
     // follows the load-time verdict, not a later `sourcelang` force.
     // See `pclntab::function_entries`.
-    if arch.analysis_fast_funcdisc
+    if allow_fast_funcdisc
         && !arch.analysis_listing
         && arch.source_lang_detected == kuna_decomp::kuna_sourcelang::SourceLang::Go
     {
@@ -884,7 +914,7 @@ pub fn run_listing_consumers_replaying_observed(
     // have no recognizable prologue (Ghidra's disassembler-driven recursive descent).
     // betaflight STM32F405: the walk grows 1 -> 1470 discovered functions (Ghidra 1822).
     // Gated by the same flag, so x86-64 (funcstart_patterns off) is unchanged.
-    if arch.analysis_listing && arch.analysis_funcstart_patterns {
+    if arch.analysis_listing && allow_funcstart_patterns {
         let execs = crate::entry::executable_sections(&file);
         let patterns = crate::entry::full_pattern_starts(&file);
         let pattern_set: std::collections::BTreeSet<u64> = patterns.iter().copied().collect();
@@ -958,7 +988,7 @@ pub fn run_listing_consumers_replaying_observed(
         detail,
         plan,
     );
-    if arch.analysis_fast_funcdisc
+    if allow_fast_funcdisc
         && matches!(file.architecture(), object::Architecture::I386 | object::Architecture::X86_64)
     {
         // One initial walk plus at most four accepted callback generations. The
@@ -1017,12 +1047,12 @@ pub fn run_listing_consumers_replaying_observed(
     }
     // (kuna `thunkentry`, `addrtakenentry`) Where the walk's own function set is
     // committed (`funcdisc_recursive`, `fast_funcdisc`).
-    let walk_committed = (arch.analysis_listing && arch.analysis_funcstart_patterns)
-        || arch.analysis_fast_funcdisc;
+    let walk_committed = (arch.analysis_listing && allow_funcstart_patterns)
+        || allow_fast_funcdisc;
     // (kuna `addrtakenentry`) Code whose address the program takes and no flow
     // reaches re-seeds the walk, which resumes from the Listing it already has.
     // See `aif/kuna_addrtakenentry.rs`.
-    if arch.analysis_addrtakenentry && walk_committed {
+    if allow_addrtakenentry && walk_committed {
         let evidence = crate::aif::kuna_addrtakenentry::AddrTaken::new(&file, bytes);
         if let (Some(evidence), Some(code_space)) = (evidence, arch.manage().get_default_code_space()) {
             for _ in 0..crate::aif::kuna_addrtakenentry::MAX_ROUNDS {
@@ -1051,7 +1081,7 @@ pub fn run_listing_consumers_replaying_observed(
     // keeping every entry the frameless inventory would report unless the
     // frame-expanded Listing contradicts it. A `--jobs` worker replays the
     // parent's recovery and builds only its final Listing.
-    if arch.analysis_listing && arch.analysis_funcstart_patterns && arch.analysis_armframes {
+    if arch.analysis_listing && allow_funcstart_patterns && arch.analysis_armframes {
         if let Some(code_space) = arch.manage().get_default_code_space() {
             let memo = std::rc::Rc::new(crate::listing::kuna_decodememo::DecodeMemo::new(listing.exec_ranges()));
             let mut frame_cache = match frames_replay {
@@ -1292,7 +1322,7 @@ pub fn run_listing_consumers_replaying_observed(
     let mut ptrentry_out: Vec<u64> = Vec::new();
     if let Some(checked) = &frame_aif {
         ptrentry_out.clone_from(&checked.pointer_entries);
-    } else if arch.analysis_listing && arch.analysis_ptrentry {
+    } else if arch.analysis_listing && allow_ptrentry {
         if let Some(code_space) = arch.manage().get_default_code_space() {
             ptrentry_out = crate::aif::kuna_ptrentry::pointer_entry_seeds(
                 &file,
@@ -1304,7 +1334,7 @@ pub fn run_listing_consumers_replaying_observed(
         }
     }
     let mut fast_pointer_seeds = Vec::new();
-    if arch.analysis_fast_funcdisc {
+    if allow_fast_funcdisc {
         if let Some(code_space) = arch.manage().get_default_code_space() {
             fast_pointer_seeds = crate::fast_funcdisc::pointer_table_seeds(
                 &file,
@@ -1346,7 +1376,7 @@ pub fn run_listing_consumers_replaying_observed(
     // is checked before this speculative work; the output keeps the `aif` id for
     // the defensive commit gate. A no-op (empty `entries`) when there is no code
     // space.
-    if arch.analysis_listing && arch.analysis_aif.enabled() {
+    if arch.analysis_listing && allow_aif {
         if let Some(code_space) = arch.manage().get_default_code_space() {
             let mut aif_out = AnalysisOutput::default();
             let checked = frame_aif.unwrap_or_else(|| crate::aif::kuna_entrychecks::run(
@@ -1375,7 +1405,7 @@ pub fn run_listing_consumers_replaying_observed(
     // option can never remove an entry" a property of the wiring (the walk's
     // instruction closure is invariant under the split; see
     // `listing/kuna_tailcallentry.rs`).
-    if arch.analysis_listing && arch.analysis_tailcallentry {
+    if arch.analysis_listing && allow_tailcallentry {
         let mut tce_out = AnalysisOutput::default();
         tce_out.entries =
             crate::listing::kuna_tailcallentry::tail_call_entries(&file, &listing);
@@ -1384,7 +1414,7 @@ pub fn run_listing_consumers_replaying_observed(
 
     // (kuna `calltable`) Call tables add their targets as entries; a discovered
     // entry on a switch case that nothing calls is not a function.
-    if arch.analysis_listing && arch.analysis_calltable && listing.has_refs() {
+    if arch.analysis_listing && allow_calltable && listing.has_refs() {
         let tables = crate::listing::kuna_calltable::scan(&file, &listing, arch, translate);
         let mut ct_out = AnalysisOutput::default();
         ct_out.entries = tables.entries;
@@ -1434,7 +1464,7 @@ pub fn run_listing_consumers_replaying_observed(
     // CreateFunctionCmd analog); the commit arm names them `sub_<addr>` and dedups against
     // the already-committed set. Gated by `funcdisc_recursive` → the same
     // `analysis_funcstart_patterns` flag, so x86-64 (funcstart_patterns off) is byte-identical.
-    if arch.analysis_listing && arch.analysis_funcstart_patterns {
+    if arch.analysis_listing && allow_funcstart_patterns {
         let mut rd_out = AnalysisOutput::default();
         rd_out.entries =
             listing.functions().map(|(&vma, _)| vma).chain(thunk_targets.iter().copied()).collect();
@@ -1446,7 +1476,7 @@ pub fn run_listing_consumers_replaying_observed(
         pe_out.entries = ptrentry_out;
         out.push(("ptrentry", pe_out));
     }
-    if arch.analysis_fast_funcdisc {
+    if allow_fast_funcdisc {
         let mut fast_out = AnalysisOutput::default();
         fast_out.entries = listing
             .functions()
@@ -1478,7 +1508,7 @@ pub fn run_listing_consumers_replaying_observed(
     // the entry before it branches to locally, is that function's code. Read off
     // the finished partition and every entry stream above, so the commit drops
     // it whichever oracle proposed it. See `listing/kuna_falseentry.rs`.
-    if arch.analysis_listing && arch.analysis_funcstart_patterns {
+    if arch.analysis_listing && allow_funcstart_patterns {
         if let Some(code_space) = arch.manage().get_default_code_space() {
             let mut candidates: std::collections::BTreeSet<u64> =
                 committed_entries.iter().copied().chain(listing.functions().map(|(&vma, _)| vma)).collect();

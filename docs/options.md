@@ -694,6 +694,9 @@ Three tiers:
 | go runtime passes do not run on a go binary whose buildinfo section was stripped | [`sourcelang`](#sourcelang----auto--c--rust--go--swift-default-auto) |
 | kuna decompile on a large c++ .so needs ~750 MB for one function | [`lazyfuncs`](#lazyfuncs----on--off-default-off) |
 | read symbols dominates a single-function run on an entry-dense image | [`lazyfuncs`](#lazyfuncs----on--off-default-off) |
+| large PE64 binary reports many more functions than its .pdata RUNTIME_FUNCTION table | [`pdataonly`](#pdataonly----on--off-default-off) |
+| speculative PE entry discovery invents functions inside padding or jump tables | [`pdataonly`](#pdataonly----on--off-default-off) |
+| PE64 function extents run past .pdata EndAddress | [`pdataonly`](#pdataonly----on--off-default-off) |
 | objective-c methods render as sub_<addr> instead of -[Class sel] | [`objc`](#objc----on--off-default-on) |
 | __objc_ metadata present but classes and selectors unnamed in a mach-o | [`objc`](#objc----on--off-default-on) |
 | a message send renders as sub_<addr>(obj) through an __objc_stubs entry | [`objc`](#objc----on--off-default-on) |
@@ -2381,6 +2384,14 @@ Program-prep enablement: what is discovered, decoded, and named before any funct
 - **When to flip:** Off (default) is Ghidra's whole-inventory commit. On builds a Function only for the selection and for what its p-code reads (call and tail targets, code addresses taken as values): `kuna decompile <big c++ .so> <fn>` drops 30-38% of peak and 33-42% of the time on entry-dense images, byte-identical over 102 sampled functions across six images. Gains track entry density (a Go binary moves 2%); a whole-binary surface still materializes everything it walks.
 - **Where / provenance:** P1/code-data-partition · kuna · speed · kuna-lazyfuncs
 - **Example:** `option lazyfuncs on`
+
+### `pdataonly` -- on | off, default `off`
+
+- **Symptoms:** large PE64 binary reports many more functions than its .pdata RUNTIME_FUNCTION table; speculative PE entry discovery invents functions inside padding or jump tables; PE64 function extents run past .pdata EndAddress.
+- **What it does:** On a PE64 image carrying a non-empty .pdata exception directory, treat non-chained .pdata RUNTIME_FUNCTION records (plus the PE entry point, exports, and TLS callbacks) as authoritative for function discovery and extents. Suppresses speculative PE entry sources (prologue byte patterns, relocated code pointers, fast_funcdisc, addrtakenentry, aif, ptrentry) and applies each non-chained [BeginAddress, EndAddress) record as the function extent unless overridden by --define-function.
+- **When to flip:** Off (default) runs all standard PE discovery oracles so frameless leaf functions and relocated callbacks are also recovered. Turn on for large x64 Windows binaries where speculative discovery inflates function counts or merges across padding, and .pdata RUNTIME_FUNCTION records should dictate exact function entries and bounds. Inert on non-PE64 binaries or PE64 images with an empty exception directory.
+- **Where / provenance:** P1/external-refinement · kuna · analysis-enablement · kuna-pdataonly
+- **Example:** `option pdataonly on`
 
 ### `objc` -- on | off, default `on`
 

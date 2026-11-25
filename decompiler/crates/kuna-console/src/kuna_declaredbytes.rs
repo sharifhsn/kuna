@@ -51,6 +51,84 @@ pub(crate) struct Declaration {
 /// transcript, read back by [`from_transcript`].
 const TRANSCRIPT_PREFIX: &str = "warning: declared function ";
 
+/// Hoists loader byte-map and inaccessible-segment metadata across a batch of
+/// declarations so `declare_functions` avoids per-entry `RefCell` borrows and
+/// `Vec` allocations.
+pub(crate) struct BatchMeasurer {
+    inaccessible: Vec<(u64, u64)>,
+    shared: Option<std::sync::Arc<dyn kuna_sleigh::loadimage::ImageBytes>>,
+    sections: Vec<(u64, u64, u32)>,
+}
+
+impl BatchMeasurer {
+    pub(crate) fn new(prog: &ConsoleProgram) -> Self {
+        let loader_rc = prog.arch().translate().loader_rc();
+        let loader = loader_rc.borrow();
+        let inaccessible = loader.inaccessible_segments();
+        let shared = loader.shared_bytes();
+        drop(loader);
+        let sections = if shared.is_none() { prog.sections() } else { Vec::new() };
+        Self { inaccessible, shared, sections }
+    }
+
+    pub(crate) fn measure(&self, prog: &ConsoleProgram, start: u64, size: u64) -> DeclaredBytes {
+        let Some(end) = start.checked_add(size.max(1)) else {
+            return DeclaredBytes::Unmapped;
+        };
+        let blocked = self
+            .inaccessible
+            .iter()
+            .filter(|&&(vma, sz)| vma < end && vma.saturating_add(sz) > start)
+            .map(|&(vma, _)| vma.max(start))
+            .min();
+        let unserved = self.first_unserved(prog, start, end);
+        let first = match (unserved, blocked) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        match first {
+            None => DeclaredBytes::Mapped,
+            Some(at) if at == start => DeclaredBytes::Unmapped,
+            Some(at) => DeclaredBytes::Partial { first_unmapped: at },
+        }
+    }
+
+    fn first_unserved(&self, prog: &ConsoleProgram, lo: u64, hi: u64) -> Option<u64> {
+        if let Some(bytes) = &self.shared {
+            if bytes.mapped_covers(lo, hi) {
+                return None;
+            }
+            let (mut covered, mut short) = (lo, hi);
+            while short - covered > 1 {
+                let mid = covered + (short - covered) / 2;
+                if bytes.mapped_covers(lo, mid) {
+                    covered = mid;
+                } else {
+                    short = mid;
+                }
+            }
+            return Some(covered);
+        }
+        if self.sections.is_empty() {
+            return (!prog.vma_bytes_mapped(lo)).then_some(lo);
+        }
+        let mut cur = lo;
+        while cur < hi {
+            match self
+                .sections
+                .iter()
+                .filter(|&&(start, size, _)| cur >= start && cur - start < size)
+                .map(|&(start, size, _)| start.saturating_add(size))
+                .max()
+            {
+                Some(reach) => cur = reach,
+                None => return Some(cur),
+            }
+        }
+        None
+    }
+}
+
 /// Measure the declaration at byte address `start` spanning `size` bytes
 /// (`0` = no declared end). The last byte of the address space ends no
 /// half-open extent, so the lifter never counts it mapped and neither does this.

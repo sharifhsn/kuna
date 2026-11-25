@@ -5206,6 +5206,26 @@ inspiration = "Ghidra createFunctionIfMissing deferred to the first getFunctionA
 change_kind = "speed"
 tier = "analysis"
 symptoms = "kuna decompile on a large c++ .so needs ~750 MB for one function|read symbols dominates a single-function run on an entry-dense image"
+
+[[settable]]
+option = "pdataonly"
+values = "on|off"
+default = "off"
+destructive = false
+phase = "P1"
+subphase = "external-refinement"
+strength = "HARD"
+rewind = "P1"
+issue = "kuna-pdataonly"
+summary = "On a PE64 image carrying a non-empty .pdata exception directory, treat non-chained .pdata RUNTIME_FUNCTION records (plus the PE entry point, exports, and TLS callbacks) as authoritative for function discovery and extents. Suppresses speculative PE entry sources (prologue byte patterns, relocated code pointers, fast_funcdisc, addrtakenentry, aif, ptrentry) and applies each non-chained [BeginAddress, EndAddress) record as the function extent unless overridden by --define-function."
+use_when = "Off (default) runs all standard PE discovery oracles so frameless leaf functions and relocated callbacks are also recovered. Turn on for large x64 Windows binaries where speculative discovery inflates function counts or merges across padding, and .pdata RUNTIME_FUNCTION records should dictate exact function entries and bounds. Inert on non-PE64 binaries or PE64 images with an empty exception directory."
+example = "option pdataonly on"
+source_decompiler = "kuna"
+inspiration = "Windows x64 PE .pdata RUNTIME_FUNCTION exception directory"
+change_kind = "analysis-enablement"
+tier = "analysis"
+symptoms = "large PE64 binary reports many more functions than its .pdata RUNTIME_FUNCTION table|speculative PE entry discovery invents functions inside padding or jump tables|PE64 function extents run past .pdata EndAddress"
+
 [[settable]]
 option = "objc"
 values = "on|off"

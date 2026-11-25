@@ -571,6 +571,9 @@ mod tests {
               // anyway, so preset membership would buy nothing there and has not been
               // measured on them. Flip it into the preset with that measurement.
               "lazyfuncs",
+              // `pdataonly` suppresses frameless leaf and relocated-callback discovery on PE64
+              // in favor of strictly `.pdata`-backed entries and extents, so it stays opt-in.
+              "pdataonly",
               // `libgccsigs` costs a SPARC32 caller that returns arithmetic on
               // the `__divdi3` quotient its low word or its whole return (see its
               // catalog row), so the preset must not turn it on.

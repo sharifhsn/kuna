@@ -7702,6 +7702,25 @@ survives. x86/x64 PE only: the 8-byte ARM/ARM64 `RUNTIME_FUNCTION` carries no
 so the pass abstains on both rather than guess — the same stance the
 base-relocation oracle takes.
 
+**(kuna) PE64 `.pdata`-authoritative discovery and extents** (`pdataonly`,
+default **off**;
+`decompiler/crates/kuna-analysis/src/analyzers/entry/pe_entry.rs`,
+`decompiler/crates/kuna-console/src/engine.rs`). On a PE64 image carrying a
+non-empty `.pdata` exception directory, flipping `--option pdataonly on` treats
+the image's non-chained `RUNTIME_FUNCTION` records (together with the PE entry
+point, exports, and TLS callbacks) as authoritative for both function entries
+and function extents. At the analysis commit boundary, speculative PE entry
+sources — Oracle 5 prologue byte patterns (`prologue_pattern_starts`),
+base-relocation code pointers (`reloc_code_pointers`), `fast_funcdisc`,
+`addrtakenentry`, `aif`, `ptrentry`, `funcstart_patterns`, `tailcallentry`, and
+`calltable` — are suppressed so the inventory matches the `.pdata` table without
+speculative inflation. Each non-chained x64 `[BeginAddress, EndAddress)` record
+is also recorded as that function's byte extent (`ConsoleProgram::declared_extent`),
+bounding inventory sizing, disassembly, and flow following (`FlowInfo::setRange`)
+directly to `.pdata` unless explicitly overridden by `--define-function`. On
+non-PE64 binaries or PE64 binaries whose exception directory has no non-chained
+records, `pdataonly` is a no-op.
+
 **(kuna) Nor are the interiors of PDB procedures** (`pdbinterior`, always on,
 DIV-180; `decompiler/crates/kuna-analysis/src/analyzers/pdb/kuna_pdbinterior.rs`).
 The exception table only describes functions that need unwind data, so a frameless

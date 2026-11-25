@@ -78,16 +78,27 @@ pub(super) fn pe_entry_candidates(
     bytes: &[u8],
     execs: &[(u64, u64, Vec<u8>)],
 ) -> Vec<u64> {
+    pe_entry_candidates_inner(file, bytes, Some(execs))
+}
+
+/// Collect PE64 entry candidates from authoritative structural sources only:
+/// entry point, exports, non-chained `.pdata` `BeginAddress`es, and TLS callbacks.
+pub(super) fn pe_entry_candidates_pdata_only(file: &object::File, bytes: &[u8]) -> Vec<u64> {
+    pe_entry_candidates_inner(file, bytes, None)
+}
+
+fn pe_entry_candidates_inner(
+    file: &object::File,
+    bytes: &[u8],
+    reloc_execs: Option<&[(u64, u64, Vec<u8>)]>,
+) -> Vec<u64> {
     let mut out: Vec<u64> = Vec::new();
 
-    // Oracle 1: the entry point. `object` returns the rebased VMA for PE.
     let entry = file.entry();
     if entry != 0 {
         out.push(entry);
     }
 
-    // Oracle 4 (exports): a named export is also a function start. Address only;
-    // the name rides the funcsym stream (`pe_iat`).
     if let Ok(exports) = file.exports() {
         for e in exports {
             if e.address() != 0 {
@@ -96,17 +107,15 @@ pub(super) fn pe_entry_candidates(
         }
     }
 
-    // Oracles 2 + 3 (.pdata + TLS) need the typed PE parser for the data
-    // directories; branch on the concrete PE width.
     match FileKind::parse(bytes) {
         Ok(FileKind::Pe64) => {
             if let Ok(pe) = PeFile64::parse(bytes) {
-                collect_typed::<ImageNtHeaders64>(&pe, bytes, 8, execs, &mut out);
+                collect_typed::<ImageNtHeaders64>(&pe, bytes, 8, reloc_execs, &mut out);
             }
         }
         Ok(FileKind::Pe32) => {
             if let Ok(pe) = PeFile32::parse(bytes) {
-                collect_typed::<ImageNtHeaders32>(&pe, bytes, 4, execs, &mut out);
+                collect_typed::<ImageNtHeaders32>(&pe, bytes, 4, reloc_execs, &mut out);
             }
         }
         _ => {}
@@ -115,20 +124,77 @@ pub(super) fn pe_entry_candidates(
     out
 }
 
-/// Append the `.pdata` `BeginAddress`es, the TLS callbacks and the relocated
-/// code pointers for a typed PE. `ptr` is the pointer width (8 for PE32+, 4 for
-/// PE32) — the TLS callback array and the relocated words are both of that width.
+/// Whether `bytes` is a PE64 image carrying at least one non-chained `.pdata`
+/// `RUNTIME_FUNCTION` record.
+pub fn has_pe64_pdata(bytes: &[u8]) -> bool {
+    if !matches!(FileKind::parse(bytes), Ok(FileKind::Pe64)) {
+        return false;
+    }
+    let Ok(pe) = PeFile64::parse(bytes) else {
+        return false;
+    };
+    let mut begins = Vec::new();
+    pdata_begins(&pe, bytes, pe.relative_address_base(), &mut begins);
+    !begins.is_empty()
+}
+
+/// Non-chained PE64 `.pdata` `RUNTIME_FUNCTION` `[BeginAddress, EndAddress)`
+/// ranges (VMAs), sorted by `BeginAddress`. Empty on non-PE64 or non-x64 images.
+pub fn pe64_pdata_extents(bytes: &[u8]) -> Vec<(u64, u64)> {
+    if !matches!(FileKind::parse(bytes), Ok(FileKind::Pe64)) {
+        return Vec::new();
+    }
+    let Ok(pe) = PeFile64::parse(bytes) else {
+        return Vec::new();
+    };
+    let Some(PdataForm::X86) =
+        PdataForm::for_machine(pe.nt_headers().file_header().machine.get(LE))
+    else {
+        return Vec::new();
+    };
+    let Some(dir) = pe.data_directories().get(object::pe::IMAGE_DIRECTORY_ENTRY_EXCEPTION) else {
+        return Vec::new();
+    };
+    if dir.size.get(LE) == 0 {
+        return Vec::new();
+    }
+    let Ok(data) = dir.data(bytes, &pe.section_table()) else {
+        return Vec::new();
+    };
+    let image_base = pe.relative_address_base();
+    let mut out = Vec::with_capacity(data.len() / 12);
+    for rec in data.chunks_exact(12) {
+        let begin_rva = read_u32(rec, 0);
+        let end_rva = read_u32(rec, 4);
+        let unwind_rva = read_u32(rec, 8);
+        if begin_rva == 0 || end_rva <= begin_rva || unwind_is_chained(&pe, bytes, unwind_rva) {
+            continue;
+        }
+        out.push((
+            image_base.wrapping_add(begin_rva as u64),
+            image_base.wrapping_add(end_rva as u64),
+        ));
+    }
+    out.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+    out.dedup_by_key(|r| r.0);
+    out
+}
+
+/// Append the `.pdata` `BeginAddress`es, the TLS callbacks and (when
+/// `reloc_execs` is `Some`) the relocated code pointers for a typed PE.
 fn collect_typed<Pe: ImageNtHeaders>(
     pe: &PeFile<Pe>,
     bytes: &[u8],
     ptr: usize,
-    execs: &[(u64, u64, Vec<u8>)],
+    reloc_execs: Option<&[(u64, u64, Vec<u8>)]>,
     out: &mut Vec<u64>,
 ) {
     let image_base = pe.relative_address_base();
     pdata_begins(pe, bytes, image_base, out);
     tls_callbacks(pe, bytes, ptr, out);
-    super::kuna_pereloccode::reloc_code_pointers(pe, bytes, image_base, ptr, execs, out);
+    if let Some(execs) = reloc_execs {
+        super::kuna_pereloccode::reloc_code_pointers(pe, bytes, image_base, ptr, execs, out);
+    }
 }
 
 /// Walk the exception directory (`.pdata`) as an array of `RUNTIME_FUNCTION`

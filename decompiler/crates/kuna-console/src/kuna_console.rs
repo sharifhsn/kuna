@@ -343,6 +343,7 @@ pub fn kuna_live_value(conf: &Architecture, option: &str) -> Option<Cow<'static,
         },
         "elfmain" => on_off(conf.analysis_elfmain),
         "fast_funcdisc" => on_off(conf.analysis_fast_funcdisc),
+        "pdataonly" => on_off(conf.analysis_pdataonly),
         // (kuna `aif`) Four-valued, so it reports its own token.
         "aif" => conf.analysis_aif.as_str(),
         "aifpoolslide" => on_off(conf.analysis_aifpoolslide),

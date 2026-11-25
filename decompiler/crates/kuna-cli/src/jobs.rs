@@ -176,6 +176,7 @@ pub(crate) struct PoolConfig<'a> {
     pub(crate) mode: &'static str,
     pub(crate) options: &'a [(String, String)],
     pub(crate) func_decls: Vec<String>,
+    pub(crate) only_declared: bool,
     pub(crate) jump_assertions: &'a [kuna_console::assertions::Directive],
     pub(crate) no_vars: bool,
     pub(crate) want_proto: bool,
@@ -497,6 +498,10 @@ impl Session {
             ).collect();
             std::fs::write(scratch.path().join("jumps.assert"), lines.join("\n"))
                 .map_err(|e| format!("cannot write worker jump assertions: {e}"))?;
+        }
+        if !cfg.func_decls.is_empty() {
+            std::fs::write(scratch.path().join("funcs.decl"), cfg.func_decls.join("\n"))
+                .map_err(|e| format!("cannot write worker function declarations: {e}"))?;
         }
         if !cfg.full_load {
             let path = scratch.path().join(INVENTORY_FILE);
@@ -1120,8 +1125,11 @@ impl Worker {
         if !cfg.jump_assertions.is_empty() {
             cmd.arg("--assert").arg(format!("@{}", scratch.join("jumps.assert").display()));
         }
-        for decl in &cfg.func_decls {
-            cmd.arg("--define-function").arg(decl);
+        if !cfg.func_decls.is_empty() {
+            cmd.arg("--define-function").arg(format!("@{}", scratch.join("funcs.decl").display()));
+        }
+        if cfg.only_declared {
+            cmd.arg("--only-declared");
         }
         // The parent's resolved options, verbatim — except the one decision a
         // worker must NOT inherit.  `fast_funcdisc` is the whole-binary function
@@ -2920,6 +2928,7 @@ mod tests {
             mode: "fast",
             options: &[],
             func_decls: Vec::new(),
+            only_declared: false,
             jump_assertions: &[],
             no_vars: false,
             want_proto: false,

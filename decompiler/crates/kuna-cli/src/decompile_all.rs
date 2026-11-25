@@ -95,6 +95,9 @@ pub(crate) struct Args {
     /// loads through this struct honors them; only the surfaces that parse the
     /// flag can be non-empty.
     pub(crate) func_decls: Vec<crate::funcdecl::FuncDecl>,
+    /// `--only-declared`: treat caller `--define-function` boundaries as the
+    /// authoritative target set and suppress speculative entry discovery.
+    pub(crate) only_declared: bool,
     /// `--assert <directive> | @FILE` (repeatable): the caller-supplied
     /// assertions, installed by [`load_program`] before the analysis commit for
     /// the image-scoped `bytes` and right after it for the program-scoped rest,
@@ -173,6 +176,7 @@ impl Args {
             max_fn_memory: Some(0),
             options: Vec::new(),
             func_decls: Vec::new(),
+            only_declared: false,
             assertions: Vec::new(),
             assert_strict: false,
             slice: None,
@@ -1047,6 +1051,7 @@ pub(crate) fn pool_config<'a>(
         options: &args.options,
         jump_assertions: &args.assertions,
         func_decls: args.func_decls.iter().map(crate::funcdecl::FuncDecl::flag_value).collect(),
+        only_declared: args.only_declared,
         no_vars: args.no_vars,
         want_proto,
         want_provenance,
@@ -1272,7 +1277,10 @@ fn run_summary(args: &Args, filters: &Filters) -> i32 {
     let loaded = match request {
         Some(request) => load_program_with_rust_profiles(args, DriverDefaults::Functions, Some(request))
             .map(|prog| {
-                let all = prog.function_entries_canonical();
+                let mut all = prog.function_entries_canonical();
+                if args.only_declared {
+                    all.retain(|e| prog.is_declared_entry(e.addr.get_offset()));
+                }
                 (prog, all)
             }),
         None => list_functions(args),
@@ -1567,7 +1575,10 @@ fn list_functions(args: &Args) -> Result<(ConsoleProgram, Vec<FunctionEntry>), S
     // One record per entry address, address-ordered, alias names carried as data
     // (issue #197 — this used to dedup by (address, name), so a function the
     // loader and an analysis pass both named was listed twice).
-    let entries = prog.function_entries_canonical();
+    let mut entries = prog.function_entries_canonical();
+    if args.only_declared {
+        entries.retain(|e| prog.is_declared_entry(e.addr.get_offset()));
+    }
     Ok((prog, entries))
 }
 
@@ -1855,6 +1866,21 @@ fn load_program_with_rust_profiles(
     // BEFORE the gated analysis commit (the `option` < `read symbols` ordering
     // the script path enforces), so a per-pass gate takes effect.
     apply_runtime_options(&mut prog, &args.options)?;
+    if args.only_declared {
+        let arch = prog.arch_mut();
+        arch.analysis_entry_disc = false;
+        arch.analysis_fast_funcdisc = false;
+        arch.analysis_aif = kuna_decomp::kuna_aif::AifMode::Off;
+        arch.analysis_ptrentry = false;
+        arch.analysis_addrtable = false;
+        arch.analysis_calltable = false;
+        arch.analysis_tailcallentry = false;
+        arch.analysis_addrtakenentry = false;
+        arch.analysis_funcstart_patterns = false;
+        arch.analysis_eh_frame_full = false;
+        arch.analysis_unwindstarts = false;
+        arch.analysis_cortexmvectors = false;
+    }
     // (kuna `--assert bytes`) The IMAGE-scoped directives, before the commit and
     // before any read of the addresses they name: a byte overlay states what the
     // running program put there, and every later decode has to see it. The
@@ -2019,9 +2045,13 @@ fn resolve_targets_with_policy(
     let mut seen = std::collections::HashSet::new();
     targets.retain(|e| seen.insert(e.addr.get_offset()));
 
-    // No filter at all ⇒ every executable function, exactly once.
+    // No filter at all ⇒ every executable function, exactly once (or strictly
+    // caller-declared entries under `--only-declared`).
     if args.addrs.is_empty() && args.names.is_none() {
         targets = prog.function_entries_executable();
+        if args.only_declared {
+            targets.retain(|e| prog.is_declared_entry(e.addr.get_offset()));
+        }
     }
     Ok(targets)
 }
@@ -2968,6 +2998,7 @@ pub(crate) fn parse_args_with_filters(
     let mut max_fn_memory: Option<u64> = None;
     let mut options: Vec<(String, String)> = Vec::new();
     let mut func_decls: Vec<crate::funcdecl::FuncDecl> = Vec::new();
+    let mut only_declared = false;
     let mut assertions: Vec<kuna_console::assertions::Directive> = Vec::new();
     let mut assert_strict = false;
     let mut types: Vec<String> = Vec::new();
@@ -3034,6 +3065,7 @@ pub(crate) fn parse_args_with_filters(
                 let v = take(argv, &mut i, "--define-function")?;
                 func_decls.extend(crate::funcdecl::parse_flag(&v)?);
             }
+            "--only-declared" => only_declared = true,
             "--assert" => {
                 let v = take(argv, &mut i, "--assert")?;
                 assertions.extend(crate::assertdecl::parse_flag(&v)?);
@@ -3156,6 +3188,9 @@ pub(crate) fn parse_args_with_filters(
     }
 
     let binary = binary.ok_or_else(|| format!("{cmd} requires <binary>"))?;
+    if only_declared && func_decls.is_empty() {
+        return Err("--only-declared requires at least one --define-function".into());
+    }
     let assertions = crate::assertdecl::with_types(&types, types_cpp.as_deref(), assertions)?;
     if filters.rust_signature_manifest.is_some() {
         if apply_rust_signatures.is_some() {
@@ -3332,6 +3367,7 @@ pub(crate) fn parse_args_with_filters(
             max_fn_memory,
             options,
             func_decls,
+            only_declared,
             assertions,
             assert_strict,
             slice,
@@ -3391,7 +3427,7 @@ fn usage_decompile_all() {
          \x20                   [--jobs N|auto] [--jobs-chunk N] [--jobs-full-load] \\\n\
          \x20                   [--filter REGEX] [--min-size N] [--max-size N] \\\n\
          \x20                   [--reachable-from <name|0xaddr>] [--sort addr|size|name] [--limit N] \\\n\
-         \x20                   [--summary] [--define-function S[-E][=N]|@FILE].. \\\n\
+         \x20                   [--summary] [--define-function S[-E][=N]|@FILE].. [--only-declared] \\\n\
          \x20                   [--option N V].. [--isa auto|arm|thumb] [--slice ARCH] [--target T] [--sleighpath D]\n\
          \x20                   [--raw-image --target T --base VMA (--entry|--addr VMA)..]\n\
          \n\
@@ -3463,7 +3499,7 @@ fn usage_functions() {
         "usage: kuna functions <binary> [--json] [--summary] \\\n\
          \x20               [--filter REGEX] [--min-size N] [--max-size N] \\\n\
          \x20               [--reachable-from <name|0xaddr>] [--sort addr|size|name] [--limit N] \\\n\
-         \x20               [--define-function S[-E][=N]|@FILE].. [--jobs N|auto] \\\n\
+         \x20               [--define-function S[-E][=N]|@FILE].. [--only-declared] [--jobs N|auto] \\\n\
          \x20               [--mode auto|reliable|aggressive|fast] [--isa auto|arm|thumb] [--slice ARCH] [--target T] [--sleighpath D]\n\
          \x20               [--raw-image --target T --base VMA (--entry|--addr VMA)..]\n\
          \x20               [--rust-signature-manifest PATH (requires --summary --json)]\n\

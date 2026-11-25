@@ -102,6 +102,7 @@ pub mod kuna_pereloccode;
 mod macho_entry;
 pub mod patterns;
 mod pe_entry;
+pub use pe_entry::{has_pe64_pdata, pe64_pdata_extents};
 
 // ===========================================================================
 // The image entry point, as a virtual address
@@ -456,6 +457,46 @@ pub(crate) fn collect_entries_for_language(
     language: &str,
 ) -> Vec<u64> {
     collect_entries_with_pe_mode(file, bytes, crate::loadimage_object::is_arm32_language(language))
+}
+
+/// Discover PE64 entries strictly from `.pdata` non-chained `BeginAddress`es,
+/// PE entry point, exports, and TLS callbacks (no Oracle 5 prologue patterns or
+/// relocated code pointers).
+pub fn collect_pe64_pdata_only_entries(
+    file: &object::File,
+    bytes: &[u8],
+    language: Option<&str>,
+) -> Vec<u64> {
+    let pe_arm = match language {
+        Some(lang) => crate::loadimage_object::is_arm32_language(lang),
+        None => {
+            crate::loadimage_object::effective_architecture(file, bytes)
+                == object::Architecture::Arm
+        }
+    };
+    let execs = executable_sections(file);
+    let funcsyms = existing_function_addrs(file, bytes);
+    let code_address = |vma: u64| if pe_arm { vma & !1 } else { vma };
+    let exempt = crate::loader::pe_headers::header_entry(file, bytes).map(code_address);
+    let mut out: Vec<u64> = Vec::new();
+    for vma in pe_entry::pe_entry_candidates_pdata_only(file, bytes)
+        .into_iter()
+        .map(code_address)
+    {
+        if vma == 0 {
+            continue;
+        }
+        if !in_executable_section(&execs, vma) && Some(vma) != exempt {
+            continue;
+        }
+        if funcsyms.binary_search(&vma).is_ok() {
+            continue;
+        }
+        out.push(vma);
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 fn collect_entries_with_pe_mode(file: &object::File, bytes: &[u8], pe_arm: bool) -> Vec<u64> {

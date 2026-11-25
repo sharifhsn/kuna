@@ -113,12 +113,14 @@ pub(crate) fn apply(
     prog: &mut kuna_console::engine::ConsoleProgram,
     decls: &[FuncDecl],
 ) -> Result<(), String> {
+    if decls.is_empty() {
+        return Ok(());
+    }
     let Some(space) = prog.arch().manage().get_default_code_space().cloned() else {
-        if decls.is_empty() {
-            return Ok(());
-        }
         return Err("--define-function: the loaded program has no default code space".into());
     };
+    let mut prepared: Vec<(kuna_base::address::Address, Option<&str>, kuna_base::types::int4)> =
+        Vec::with_capacity(decls.len());
     for decl in decls {
         let start = prog
             .input_code_offset(decl.start)
@@ -144,11 +146,10 @@ pub(crate) fn apply(
             }
         };
         let addr = kuna_base::address::Address::new(std::rc::Rc::clone(&space), start);
-        prog.declare_function(addr, decl.name.as_deref(), size)
-            .map_err(|e| {
-                format!("--define-function {:#x}: {}", decl.start, e.explain())
-            })?;
+        prepared.push((addr, decl.name.as_deref(), size));
     }
+    prog.declare_functions(&prepared)
+        .map_err(|e| format!("--define-function: {}", e.explain()))?;
     Ok(())
 }
 

@@ -169,6 +169,7 @@ pub(crate) struct DisArgs {
     /// function boundaries, applied at load so `disassemble <name>` resolves a
     /// name the image never carried and the walk stops at the declared end.
     pub(crate) func_decls: Vec<crate::funcdecl::FuncDecl>,
+    pub(crate) only_declared: bool,
     pub(crate) mode: Option<String>,
     pub(crate) slice: Option<String>,
     pub(crate) target: Option<String>,
@@ -337,6 +338,7 @@ fn load_args(args: &DisArgs, options: Vec<(String, String)>) -> Args {
         max_fn_seconds: 0,
         options,
         func_decls: args.func_decls.clone(),
+        only_declared: args.only_declared,
         assertions: Vec::new(),
         assert_strict: false,
         slice: args.slice.clone(),
@@ -1149,6 +1151,7 @@ pub(crate) fn parse_args_for(argv: &[String], command: &str) -> Result<DisArgs, 
     let mut json = false;
     let mut options: Vec<(String, String)> = Vec::new();
     let mut func_decls: Vec<crate::funcdecl::FuncDecl> = Vec::new();
+    let mut only_declared = false;
     let mut mode: Option<String> = None;
     let mut slice: Option<String> = None;
     let mut target: Option<String> = None;
@@ -1171,6 +1174,7 @@ pub(crate) fn parse_args_for(argv: &[String], command: &str) -> Result<DisArgs, 
                 let v = take(argv, &mut i, "--define-function")?;
                 func_decls.extend(crate::funcdecl::parse_flag(&v)?);
             }
+            "--only-declared" => only_declared = true,
             "--isa" => isa = kuna_console::engine::ArmIsa::parse(&take(argv, &mut i, "--isa")?)?,
             "--slice" => slice = Some(take(argv, &mut i, "--slice")?),
             "--target" => target = Some(take(argv, &mut i, "--target")?),
@@ -1192,6 +1196,9 @@ pub(crate) fn parse_args_for(argv: &[String], command: &str) -> Result<DisArgs, 
     let binary = it.next().ok_or_else(|| format!("{command} requires <binary>"))?;
     let spec =
         it.next().ok_or_else(|| format!("{command} requires <name|0xaddr|0xstart-0xend>"))?;
+    if only_declared && func_decls.is_empty() {
+        return Err("--only-declared requires at least one --define-function".into());
+    }
     Ok(DisArgs {
         binary,
         spec,
@@ -1203,6 +1210,7 @@ pub(crate) fn parse_args_for(argv: &[String], command: &str) -> Result<DisArgs, 
         json,
         options,
         func_decls,
+        only_declared,
         mode,
         slice,
         target,
@@ -1232,7 +1240,7 @@ fn usage() {
         "usage: kuna disassemble|read <binary> <name|0xaddr|0xstart-0xend> [--addr] \\\n\
          \x20                    [--as code|data|auto] [--count N] [--bytes N] [--follow] [--json] \\\n\
          \x20                    [--mode auto|reliable|aggressive|fast] \\\n\
-         \x20                    [--define-function S[-E][=N]|@FILE].. \\\n\
+         \x20                    [--define-function S[-E][=N]|@FILE].. [--only-declared] \\\n\
          \x20                    [--option N V].. [--isa auto|arm|thumb] [--slice ARCH] [--target T] [--sleighpath D]\n\
          \n\
          The target is a function name, an address (--addr for a bare hex one), or an\n\
@@ -1517,6 +1525,7 @@ mod tests {
             json: false,
             options: Vec::new(),
             func_decls: Vec::new(),
+            only_declared: false,
             mode: None,
             slice: None,
             target: None,

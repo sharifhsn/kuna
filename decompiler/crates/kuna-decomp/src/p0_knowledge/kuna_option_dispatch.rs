@@ -951,6 +951,10 @@ kuna_options! { self, p1;
         analysis_lazyfuncs,
         "Materialize Function objects on demand instead of one per entry"
     ),
+    "pdataonly" => on_off!(
+        analysis_pdataonly,
+        "Authoritative PE64 .pdata-only function discovery and extents"
+    ),
     "noreturn_disc" => {
         on_off!(analysis_noreturn_disc, "Discovered-no-return Listing consumer")
     },
