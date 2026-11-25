@@ -18,6 +18,20 @@ The manual outlining pass still processes the first supplied region for a
 function. It requires one external edge entering the region, accepts at most
 one live output, and declines internal calls and stores. General pre-SSA liveness remains open.
 
+For compiler-attributed sites, save the output of `kuna functions <binary> --json`.
+From the checkout, run `python3 scripts/inline_helpers.py functions.json --name mix_hash_helper`
+to list that helper's callers, nesting depths, and half-open address ranges.
+Omitting `--name` lists all helpers. Identities are scoped to one inventory and
+debug format. Separate calls within one caller and disjoint ranges within one
+call stay distinct. The report preserves the inventory's selection counts and limits.
+
+With Gemini's PDB, the report preserved all 1,937 inline sites across 725
+helper identities. The fixture source accounts for all 13 sites of
+`mix_hash_helper`, two in each of six numbered callers and one in
+`standalone_mix_hash`. The same executable bytes with the PDB absent yielded
+zero compiler-attributed sites. An empty report describes the available debug
+information, and leaves open whether the compiler inlined any code.
+
 With generic structure inference enabled, two of three sampled method bodies
 from the MSVC fixture were byte-identical between the serial and two-worker
 streaming exports. The serial export inferred an anonymous parameter struct
