@@ -172,15 +172,34 @@ pub struct Funcdata {
     /// (kuna `varargsave`) Set when the first heritage pass folded this
     /// function's variadic register-save prologue (`p4_calls/kuna_varargsave.rs`).
     pub(crate) kuna_vararg_save: bool,
+    /// (kuna `coverage`) The bytes of every instruction the flow decoded
+    /// ([`crate::flow::decoded_ranges`]).
+    pub(crate) kuna_flow_ranges: Vec<(u64, u64)>,
     /// (kuna) Whether the function's code is unoptimized, decided once after
     /// the first heritage pass (`p3_dataflow/kuna_unoptimized.rs`).
     pub(crate) kuna_unoptimized: Option<bool>,
+    /// (kuna `dedupitetail latch`) Loop latches joined so far, and whether this
+    /// decompile runs without the join (`p8_structure/kuna_latchjoin.rs`).
+    pub(crate) kuna_latch_joins: u32,
+    pub(crate) kuna_latch_join_withdrawn: bool,
+    /// The blocks the joined latches were placed in.
+    pub(crate) kuna_latch_blocks: Vec<crate::context::BlockId>,
+    /// (kuna) Whether that first heritage pass saw the function address its
+    /// frame through a frame pointer.
+    pub(crate) kuna_frame_pointer: bool,
     /// (kuna `returndup auto`) The return statements read at the first
     /// heritage pass (`p8_structure/kuna_o0returns.rs`).
     pub(crate) kuna_o0returns: Option<Box<crate::p8_structure::kuna_o0returns::Record>>,
     /// (kuna `iteregion auto`) The conditional values read at the first
     /// heritage pass (`p8_structure/kuna_o0select.rs`).
     pub(crate) kuna_o0select: Option<Box<crate::p8_structure::kuna_o0select::Record>>,
+    /// (kuna `loweredswitch auto`) How the conditional branches of an
+    /// unoptimized function were compiled, read at the first heritage pass
+    /// (`p2_lift/kuna_o0switch.rs`).
+    pub(crate) kuna_o0switch: Option<Box<crate::p2_lift::kuna_o0switch::Record>>,
+    /// (kuna `loopcontinue auto`) The jump statements read at the first
+    /// heritage pass (`p8_structure/kuna_o0jumps.rs`).
+    pub(crate) kuna_o0jumps: Option<Box<crate::p8_structure::kuna_o0jumps::Record>>,
     pub(crate) kuna_fpu_trunc_views: Vec<OpId>,
     /// Boolean properties associated with \b this function (C++ `flags`)
     flags: uint4,
@@ -807,9 +826,16 @@ impl Funcdata {
             kuna_later_wanted: std::rc::Rc::default(),
             kuna_x87_empty_returns: Vec::new(),
             kuna_vararg_save: false,
+            kuna_flow_ranges: Vec::new(),
             kuna_unoptimized: None,
+            kuna_latch_joins: 0,
+            kuna_latch_join_withdrawn: false,
+            kuna_latch_blocks: Vec::new(),
+            kuna_frame_pointer: false,
             kuna_o0returns: None,
             kuna_o0select: None,
+            kuna_o0switch: None,
+            kuna_o0jumps: None,
             flags: 0,
             clean_up_index: 0,
             high_level_index: 0,
@@ -3824,6 +3850,13 @@ impl Funcdata {
         self.vbank.num_varnodes()
     }
 
+    /// (kuna `coverage`) The bytes of every instruction the flow decoded for
+    /// this function, delay slots included: engine byte offsets, half-open,
+    /// ascending and joined where they touch. Empty before the flow runs.
+    pub fn flow_ranges(&self) -> &[(u64, u64)] {
+        &self.kuna_flow_ranges
+    }
+
     /// Get the basic blocks container (C++ `getBasicBlocks`).
     pub fn bblocks_ref(&self) -> &BlockGraph {
         &self.bblocks
@@ -4487,9 +4520,13 @@ impl Funcdata {
         self.kuna_fpu_trunc_views.clear();
         self.kuna_x87_empty_returns.clear();
         self.kuna_vararg_save = false;
+        self.kuna_flow_ranges.clear();
         self.kuna_unoptimized = None;
+        self.kuna_frame_pointer = false;
         self.kuna_o0returns = None;
         self.kuna_o0select = None;
+        self.kuna_o0switch = None;
+        self.kuna_o0jumps = None;
         // Clear the analysis-derived flags (the exact mask from funcdata.cc:88).
         self.flags &= !(funcdata_flags::highlevel_on
             | funcdata_flags::blocks_generated

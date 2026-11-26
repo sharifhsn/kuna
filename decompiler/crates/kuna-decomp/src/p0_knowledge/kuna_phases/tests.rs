@@ -62,7 +62,7 @@ fn settable_count_is_245() {
 }
 
 #[test]
-fn tier_counts_are_50_core_131_transform_64_analysis() {
+fn tier_counts_are_50_core_132_transform_63_analysis() {
     let mut core = 0;
     let mut transform = 0;
     let mut analysis = 0;
@@ -74,7 +74,7 @@ fn tier_counts_are_50_core_131_transform_64_analysis() {
             other => panic!("invalid tier {other:?} on {}", s.option),
         }
     }
-    assert_eq!((core, transform, analysis), (50, 131, 64));
+    assert_eq!((core, transform, analysis), (50, 132, 63));
 }
 
 #[test]
@@ -606,9 +606,13 @@ fn option_values_live_value_present_for_78() {
                             // `Architecture::arm_constant_shift`.
                             | "armconstshift"
                             // (kuna) `armshiftguard` takes a MODE
-                            // (`always|needed|never`) over an enum field; its
+                            // (`always|needed|wide|never`) over an enum field; its
                             // live value is `Architecture::arm_shift_guard`.
                             | "armshiftguard"
+                            // (kuna) `rangetest` takes a MODE
+                            // (`merged|split|auto`) over an enum field; its
+                            // live value is `Architecture::range_test`.
+                            | "rangetest"
                             // (kuna) `constselectjump` takes a MODE
                             // (`off|reentry|on`) over an enum field, for the
                             // same reason.  Its live value is
@@ -713,6 +717,10 @@ fn option_values_live_value_present_for_78() {
                             // `warnstyle` and `int3pad` are here.  Its live
                             // value is `Architecture::signedness`.
                             | "signedness"
+                            // (kuna) `boolbranch` takes `fold|keep|return`
+                            // over two fields; its live value is read from
+                            // `Architecture::bool_ret` and `bool_branch_keep`.
+                            | "boolbranch"
                     ) || PASS_GATES.contains(&st.option),
                     "unexpected option with no live reader: {}",
                     st.option
@@ -895,7 +903,8 @@ fn option_values_live_value_present_for_78() {
     // +1 for `bytestorewidth` (live_field = byte_store_width).
     // +1 for `varargsave` (live_field = vararg_save).
     // +1 for `boolbranch` (live_field = bool_branch_keep).
-    assert_eq!(with_live, 90);
+    // -1: `boolbranch` became three-valued (fold|keep|return) with no `live_field`.
+    assert_eq!(with_live, 89);
 }
 
 #[test]

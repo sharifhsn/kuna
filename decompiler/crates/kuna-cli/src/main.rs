@@ -35,6 +35,7 @@ mod project_bench;
 mod project_db;
 mod project_shards;
 mod project_stream;
+mod ppc32_pic_note;
 mod runtime_hints;
 mod rust_signatures;
 mod skill;
@@ -155,8 +156,8 @@ fn usage() {
          this CLI well, embedded in the binary, no network -- for Claude Code, Codex and OpenCode\n\
          (`--dir DIR` for other agents).  `kuna install-skill --print` shows it without installing.\n\
          \n\
-         kuna decompile <binary> [--isa auto|arm|thumb] <func> [--addr] [--json] [--no-vars] [--omit aliases,line_mappings,variables,types] [--slice ARCH] [--language auto|c|rust|go] [--mode auto|reliable|aggressive|fast] [--option NAME VALUE]... [--kassert ARGS]... [--define-function S[-E][=N]|@FILE]... [--assert DIRECTIVE|@FILE]... [--types FILE.h|DIR]... [--types-cpp CC] [--max-fn-seconds N] [--max-fn-memory MiB] [--raw-image --target T --base VMA]\n\
-         kuna decompile-all <binary> [--isa auto|arm|thumb] [--json] [--functions a,b,..] [--addr 0xVMA]... [--no-vars] [--omit aliases,line_mappings,variables,types] [--language auto|c|rust|go] [--max-fn-seconds N] [--max-fn-memory MiB] [--mode auto|reliable|aggressive|fast] [--option N V]... [--define-function S[-E][=N]|@FILE]... [--assert DIRECTIVE|@FILE]... [--types FILE.h|DIR]... [--types-cpp CC] [--raw-image --target T --base VMA (--entry|--addr VMA)...]\n\
+         kuna decompile <binary> [--isa auto|arm|thumb] <func> [--addr] [--json] [--no-vars] [--omit aliases,ranges,line_mappings,variables,types] [--slice ARCH] [--language auto|c|rust|go] [--mode auto|reliable|aggressive|fast] [--option NAME VALUE]... [--kassert ARGS]... [--define-function S[-E][=N]|@FILE]... [--assert DIRECTIVE|@FILE]... [--types FILE.h|DIR]... [--types-cpp CC] [--max-fn-seconds N] [--max-fn-memory MiB] [--raw-image --target T --base VMA]\n\
+         kuna decompile-all <binary> [--isa auto|arm|thumb] [--json] [--functions a,b,..] [--coverage] [--addr 0xVMA]... [--no-vars] [--omit aliases,ranges,line_mappings,variables,types] [--language auto|c|rust|go] [--max-fn-seconds N] [--max-fn-memory MiB] [--mode auto|reliable|aggressive|fast] [--option N V]... [--define-function S[-E][=N]|@FILE]... [--assert DIRECTIVE|@FILE]... [--types FILE.h|DIR]... [--types-cpp CC] [--raw-image --target T --base VMA (--entry|--addr VMA)...]\n\
          kuna decompile-project <binary> [--isa auto|arm|thumb] [-o DIR] [--layout single|rva-slab|rva-file|turso|both] [--shard-align N] [--no-asm] [--functions a,b,..] [--addr 0xVMA]... [--max-fn-seconds N] [--max-fn-memory MiB] [--mode auto|reliable|aggressive|fast] [--option N V]... [--define-function S[-E][=N]|@FILE]... [--assert DIRECTIVE|@FILE]... [--types FILE.h|DIR]... [--types-cpp CC] [--raw-image --target T --base VMA (--entry|--addr VMA)...]\n\
          kuna decompile-graph <binary> [--isa auto|arm|thumb] [-o FILE] [--label TEXT] [--max-fn-seconds N] [--max-fn-memory MiB] [--mode auto|reliable|aggressive|fast] [--option N V]... [--define-function S[-E][=N]|@FILE]...\n\
          kuna query <db> [--rva 0x...] [--range 0xA..0xB] [--name PATTERN] [--helpers] [--json]\n\
