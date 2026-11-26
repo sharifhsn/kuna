@@ -3134,11 +3134,28 @@ pub(crate) fn parse_args_with_filters(
             "--coverage" if cmd == "decompile-all" => coverage = true,
             "--functions" => {
                 let v = take(argv, &mut i, "--functions")?;
-                names = Some(v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect());
+                names = Some(if cmd == "decompile-project" && v.starts_with('@') && !v.starts_with("@@") {
+                    selection_file(&v[1..], "--functions", |name| Ok(name.to_owned()))?
+                } else {
+                    let value = if cmd == "decompile-project" && v.starts_with("@@") { &v[1..] } else { &v };
+                    value.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+                });
             }
             "--addr" | "--entry" => {
                 let flag = a;
                 let v = take(argv, &mut i, flag)?;
+                if flag == "--addr" && cmd == "decompile-project" {
+                    if let Some(path) = v.strip_prefix('@') {
+                        addrs.extend(selection_file(path, flag, |line| {
+                            parse_entry_selector(line).or_else(|_| {
+                                kuna_console::assertsyntax::parse_function_spec(line)
+                                    .map(|decl| EntrySelector::Numeric(decl.start))
+                            })
+                        })?);
+                        i += 1;
+                        continue;
+                    }
+                }
                 let selector = parse_entry_selector(&v)?;
                 if flag == "--entry" {
                     saw_entry = true;
@@ -3502,6 +3519,21 @@ fn parse_hex(s: &str) -> Result<u64, String> {
     let t = s.trim();
     let body = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
     u64::from_str_radix(body, 16).map_err(|_| format!("invalid address {s:?}"))
+}
+
+fn selection_file<T>(path: &str, flag: &str, parse: impl Fn(&str) -> Result<T, String>) -> Result<Vec<T>, String> {
+    let text = std::fs::read_to_string(path).map_err(|error| format!("{flag} @{path}: {error}"))?;
+    let mut items = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if !line.is_empty() {
+            items.push(parse(line).map_err(|error| format!("{path}:{}: {error}", i + 1))?);
+        }
+    }
+    if items.is_empty() {
+        return Err(format!("{flag} @{path}: no selectors"));
+    }
+    Ok(items)
 }
 
 fn parse_entry_selector(s: &str) -> Result<EntrySelector, String> {

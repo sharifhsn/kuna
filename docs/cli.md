@@ -4265,7 +4265,16 @@ The `--layout` flag selects where the CLI writes function bodies.
 RVA means relative virtual address, measured from the image base. `--shard-align`
 sets the bucket size to a positive power of two in bytes. Its default is 65536.
 File-based shard layouts write `shards.json` with the paths and occupied ranges.
-`--no-asm` skips the assembly listing. All layouts write the header and README.
+With an explicit `--addr` or `--functions` selection, the assembly listing
+covers the selected entries' known byte extents in code sections. The global
+data appendix is still included. Entries with unknown extent contribute no assembly
+bytes. Unfiltered exports retain the full listing; `--no-asm` skips it.
+
+For project exports, `--addr @FILE` and `--functions @FILE` accept one
+selector per line. Blank lines and `#` comments are ignored. Address files
+also accept declaration lines from `--define-function`, selecting their start
+addresses. A name file preserves commas within a name; use `@@` for a literal
+leading `@` in a direct name argument. All layouts write the header and README.
 
 Each address-keyed layout writes `index.jsonl`, including on a serial export.
 Each row records the function's `rva`, exclusive `end_rva`, and aligned `shard`

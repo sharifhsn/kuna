@@ -530,3 +530,34 @@ fn turso_and_both_layouts_round_trip_with_kuna_query() {
     let text = String::from_utf8_lossy(&q_stream.stdout);
     assert!(text.contains("// Function: main @"), "{text}");
 }
+
+#[test]
+fn project_listing_honors_selection_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let image = fixture("pdb_prog.exe");
+    let specs = specs();
+    for (index, (flag, contents, extra)) in [
+        ("--functions", "# selection\npdb_demo_compute\n", &[][..]),
+        ("--addr", "0x140001000-0x14000100f=pdb_demo_compute\n", &["--progress"][..]),
+        ("--addr", "0x140001000 # selection\n", &["--stream", "--jobs", "2"][..]),
+    ].into_iter().enumerate() {
+        let file = dir.path().join("selectors");
+        std::fs::write(&file, contents).unwrap();
+        let input = format!("@{}", file.display());
+        let out = dir.path().join(index.to_string());
+        let mut args = vec!["decompile-project", &image, "--sleighpath", &specs,
+                            "--layout", "turso", "-o", out.to_str().unwrap(), flag, &input];
+        args.extend_from_slice(extra);
+        let result = run_kuna(&args);
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+        let rows = std::fs::read_to_string(out.join("index.jsonl")).unwrap();
+        assert_eq!(rows.lines().count(), 1);
+        let row: serde_json::Value = serde_json::from_str(rows.trim()).unwrap();
+        let start = parse_hex(row["addr"].as_str().unwrap());
+        let end = start + row["size"].as_u64().unwrap();
+        let asm = std::fs::read_to_string(out.join("pdb_prog.exe.asm")).unwrap();
+        assert!(asm.contains("pdb_demo_compute:"));
+        assert!(asm.contains(&format!("; --- code section 0x{start:x}..0x{end:x} ---")));
+        assert!(!asm.contains("140001010:"));
+    }
+}

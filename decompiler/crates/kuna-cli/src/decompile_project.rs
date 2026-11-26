@@ -57,7 +57,7 @@ use std::path::{Path, PathBuf};
 
 use kuna_console::engine::ConsoleProgram;
 use kuna_console::project::{
-    build_asm, build_header, collect_dat_addrs,
+    build_export_asm, build_header, collect_dat_addrs,
     decompile_export_targets_with_options, export_options, render_c, rva_of, BatchOutcome,
     render_readme, FuncResult, ReadmeCounts, ReadmeFacts, ReadmeLayout,
 };
@@ -421,7 +421,7 @@ pub(crate) fn decompile_project(
         None
     } else {
         let dat_addrs = collect_dat_addrs(&results);
-        Some(build_asm(&prog, &results, &dat_addrs, &file_name))
+        Some(build_export_asm(&prog, &results, &dat_addrs, &file_name, !whole))
     };
     // The CLI's `| Path |` row prints the canonicalized on-disk path (the wasm
     // front-end passes a virtual label instead), so output stays byte-identical.

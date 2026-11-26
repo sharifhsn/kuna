@@ -2006,8 +2006,19 @@ pub fn build_asm(
     dat_addrs: &BTreeSet<u64>,
     file_name: &str,
 ) -> String {
+    build_export_asm(prog, results, dat_addrs, file_name, false)
+}
+
+/// Format a project listing, optionally restricted to the selected function extents.
+pub fn build_export_asm(
+    prog: &ConsoleProgram, results: &[FuncResult], dat_addrs: &BTreeSet<u64>,
+    file_name: &str, selected: bool,
+) -> String {
     let labels = crate::project_stream::asm_labels_from_results(results);
     let mut sweep = crate::project_stream::AsmSweep::new(prog, file_name, labels);
+    if selected {
+        sweep.restrict_to(prog, results.iter().map(|r| (r.byte_address, r.size.max(0) as u64)));
+    }
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(sweep.header_lines().as_bytes());
     while !sweep.step(prog, u64::MAX, &mut buf).expect("a Vec sink cannot fail") {}

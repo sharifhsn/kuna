@@ -1023,10 +1023,15 @@ fn export(
 
     let prelude = print_c_recompile_prelude(prog.arch());
     let image_base = prog.image_base();
+    let selected = !args.addrs.is_empty() || args.names.is_some();
     let mut sweep = if export_opts.no_asm {
         None
     } else {
-        Some(AsmSweep::new(&prog, &layout.file_name, asm_labels_from_entries(&prog, &targets)))
+        let mut sweep = AsmSweep::new(&prog, &layout.file_name, asm_labels_from_entries(&prog, &targets));
+        if selected {
+            sweep.restrict_to(&prog, targets.iter().map(|e| (e.addr.get_offset(), e.size)));
+        }
+        Some(sweep)
     };
     // An image with no CODE section (or `--no-asm`) has nothing to sweep.
     if sweep.as_ref().is_none_or(AsmSweep::is_done) {

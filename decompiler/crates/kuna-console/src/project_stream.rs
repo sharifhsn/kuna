@@ -139,6 +139,37 @@ impl AsmSweep {
         }
     }
 
+    /// Limit the listing to known selected byte extents inside code sections.
+    pub fn restrict_to(&mut self, prog: &ConsoleProgram, entries: impl Iterator<Item = (u64, u64)>) {
+        let arm = is_arm(prog);
+        let mut ranges: Vec<_> = entries.filter(|(_, size)| *size > 0).map(|(addr, size)| {
+            let start = normalize(arm, addr);
+            (start, start.saturating_add(size))
+        }).collect();
+        ranges.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::new();
+        for (start, end) in ranges {
+            if let Some(last) = merged.last_mut().filter(|last| last.1 >= start) {
+                last.1 = last.1.max(end);
+            } else {
+                merged.push((start, end));
+            }
+        }
+        let mut sections = Vec::new();
+        for &(base, size) in &self.code_secs {
+            let limit = base.saturating_add(size);
+            let first = merged.partition_point(|&(_, end)| end <= base);
+            for &(start, end) in &merged[first..] {
+                if start >= limit { break; }
+                let lo = base.max(start);
+                let hi = limit.min(end);
+                if lo < hi { sections.push((lo, hi - lo)); }
+            }
+        }
+        self.code_secs = sections;
+        self.done = self.code_secs.is_empty();
+    }
+
     /// The two lines that open a `.asm`.  Not written by [`Self::step`]: a
     /// streamed export writes them when it creates the file, before the sweep
     /// starts.
