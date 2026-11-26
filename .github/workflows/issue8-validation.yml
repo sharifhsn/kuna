@@ -19,7 +19,7 @@ jobs:
           if not defined vs exit /b 1
           call "%vs%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
           cl /nologo /W4 /WX /TC /O2 /GL- /DmainCRTStartup=sample_reference_check /D_fltused=sample_unused /c pdb_float_lanes.c || exit /b 1
-          cl /nologo /W4 /WX /TC /O2 /GL- lane_consumer.c pdb_float_lanes.obj /Fe:lanes.exe /link /DEBUG:NONE /MAP:lanes.map /INCREMENTAL:NO || exit /b 1
+          cl /nologo /W4 /WX /O2 /GL- /Tclane_consumer.c pdb_float_lanes.obj /Fe:lanes.exe /link /DEBUG:NONE /MAP:lanes.map /INCREMENTAL:NO || exit /b 1
           lanes.exe || exit /b 1
           if exist lanes.pdb exit /b 1
       - uses: actions/upload-artifact@v4
