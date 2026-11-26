@@ -23,10 +23,12 @@ pub(crate) struct Access {
     pub address: Option<ByteAddress>,
 }
 
-/// Without `stackviews`, only accesses inside a recovered parameter backing
-/// are copied; other memory keeps its ordinary dereference.
+/// Without `stackviews`, copy parameter backing accesses and reinterpreted
+/// frame float reads in a function with a declared float result.
 pub(crate) fn access(fd: &Funcdata, op: OpId) -> Option<Access> {
-    if !crate::kuna_stackviews::enabled(fd) {
+    let declared_float = fd.get_func_proto().is_output_locked()
+        && fd.get_func_proto().get_output_type().is_some_and(|ty| ty.get_metatype() == type_metatype::TYPE_FLOAT);
+    if !crate::kuna_stackviews::enabled(fd) && !declared_float {
         return None;
     }
     let operation = fd.obank().get(op)?;
@@ -49,7 +51,13 @@ pub(crate) fn access(fd: &Funcdata, op: OpId) -> Option<Access> {
     };
     let address = byte_address(fd, pointer, size);
     if !fd.get_arch().stack_views && address.is_none() {
-        return None;
+        // A float lvalue through a cast into integer frame storage violates C aliasing.
+        if !declared_float || value.is_some() || datatype.get_metatype() != type_metatype::TYPE_FLOAT
+            || fd.vbank().get(operation.get_out()?)?.is_volatile()
+            || !crate::kuna_stackranges::frame_based(fd, pointer)
+        {
+            return None;
+        }
     }
     let indexed = address
         .as_ref()
