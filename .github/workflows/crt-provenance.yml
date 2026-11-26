@@ -19,7 +19,7 @@ jobs:
           if not defined vs exit /b 1
           call "%vs%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
           powershell -NoProfile -File ci-crt-provenance.ps1 || exit /b 1
-          cl /nologo /O2 /MT /EHsc fixture.cpp /link /out:fixture.exe /verbose:lib > link.log 2>&1 || (type link.log & exit /b 1)
+          cl /nologo /O2 /MT /EHsc fixture.cpp /link /out:fixture.exe /map:fixture.map /verbose:lib > link.log 2>&1 || (type link.log & exit /b 1)
           fixture.exe || exit /b 1
       - name: Save metadata and linker diagnostics
         uses: actions/upload-artifact@v4
@@ -29,3 +29,4 @@ jobs:
           path: |
             provenance.json
             link.log
+            fixture.map
