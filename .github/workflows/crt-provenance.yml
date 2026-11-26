@@ -17,7 +17,7 @@ jobs:
         run: |
           for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "vs=%%i"
           if not defined vs exit /b 1
-          call "%vs%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          call "%vs%\VC\Auxiliary\Build\vcvarsall.bat" x64 10.0.26100.0 -vcvars_ver=14.44.35207 || exit /b 1
           powershell -NoProfile -File ci-crt-provenance.ps1 || exit /b 1
           cl /nologo /O2 /MT /EHsc fixture.cpp /link /out:fixture.exe /map:fixture.map /verbose:lib > link.log 2>&1 || (type link.log & exit /b 1)
           fixture.exe || exit /b 1
