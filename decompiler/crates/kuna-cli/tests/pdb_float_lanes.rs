@@ -32,6 +32,26 @@ fn declared_float_return_preserves_bits_from_aliased_frame_storage() {
     check_lanes(&out, "unsigned long long");
 }
 
+#[test]
+fn source_record_parameter_preserves_float_lane_copy_without_a_pdb() {
+    let tmp = tempfile::tempdir().unwrap();
+    let image = tmp.path().join("pdb_float_lanes.exe");
+    fs::copy(common::fixture("msvc_float_lanes.exe"), &image).unwrap();
+    let types = tmp.path().join("source.h");
+    fs::write(&types, "struct Pair { float lane[2]; };\n").unwrap();
+    let out = tmp.path().join("export");
+    let (_, stderr, status) = common::run_kuna(&[
+        "decompile-project", image.to_str().unwrap(), "--no-asm",
+        "--define-function", "0x140001000=sample_lane", "--addr", "0x140001000",
+        "--types", types.to_str().unwrap(),
+        "--assert", "prototype 0x140001000 float sample_lane(const struct Pair *pair, unsigned int index)",
+        "--sleighpath", common::repo_root().join("specs").to_str().unwrap(),
+        "-o", out.to_str().unwrap(),
+    ]);
+    assert_eq!(status, 0, "{stderr}");
+    check_lanes(&out, "Pair");
+}
+
 fn check_lanes(out: &Path, storage: &str) {
     fs::write(out.join("consumer.c"), r#"
 #include "pdb_float_lanes.exe.h"
@@ -42,6 +62,7 @@ int main(void) {
                                 {0x7fc00123,0x7f800000}, {0xff800000,1}};
     for (unsigned i = 0; i < 4; ++i) {
         LANE_STORAGE p;
+        _Static_assert(_Generic(sample_lane(&p, 0u), float: 1, default: 0), "expected a float return");
         memcpy(&p, bits[i], sizeof p);
         for (unsigned lane = 0; lane < 2; ++lane) {
             float v = sample_lane(&p, lane);

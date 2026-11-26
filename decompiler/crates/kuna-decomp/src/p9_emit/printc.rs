@@ -10006,20 +10006,31 @@ impl PrintC {
                 return None;
             }
             let high = value.get_high()?;
-            let scope = fd.get_scope_local()?;
-            let symbol = fd.high_bank().get(high)?.kuna_link_symbol()?;
-            let record = scope.database().symbol(symbol);
-            if record.scope != scope.scope_id() || !record.is_type_locked() {
-                return None;
-            }
             let (name, offset, _) = self.emitted_high_symbol(fd, high)?;
-            let declared = self.rendered_local_decl(fd, arch, high).4?;
-            if offset > 0 || declared.get_size() != size || !whole_array_record(&declared) {
+            if offset > 0 || fd.high_bank().get(high)?.kuna_global() {
                 return None;
             }
+            let declared = self.rendered_local_decl(fd, arch, high).4?;
             crate::kuna_stackbytes::safe_load_op(fd, input, op)?;
             crate::p9_emit::kuna_stackassign::loaded_bytes(fd, input)?;
-            (name, declared)
+            if fd.get_func_proto().is_input_locked() && float_array(&input_type)
+                && input_type.get_size() == size && declared.get_size() >= size
+                && declared.get_array_base().is_some_and(|elem| float_array(&elem)
+                    && elem.get_size() == size && elem.get_array_base().map(|t| t.get_size())
+                        == input_type.get_array_base().map(|t| t.get_size()))
+            {
+                (name, input_type)
+            } else {
+                let scope = fd.get_scope_local()?;
+                let symbol = fd.high_bank().get(high)?.kuna_link_symbol()?;
+                let record = scope.database().symbol(symbol);
+                if record.scope != scope.scope_id() || !record.is_type_locked()
+                    || declared.get_size() != size || !whole_array_record(&declared)
+                {
+                    return None;
+                }
+                (name, declared)
+            }
         };
         Some(crate::p9_emit::kuna_stackassign::Assignment {
             output,
@@ -10043,7 +10054,7 @@ impl PrintC {
         use crate::printlanguage::SyntaxHighlight;
         static COMPOUND: OpToken = op_token("", " }", 2, 66, false, TokenType::Postsurround, 0, 0);
         let array_source = (super::kuna_bytearrayc::byte_array(&assignment.datatype)
-            || whole_array_record(&assignment.datatype))
+            || whole_array_record(&assignment.datatype) || float_array(&assignment.datatype))
             .then(|| assignment.operand.and_then(|input| crate::p9_emit::kuna_stackassign::loaded_bytes(fd, input))
                 .or_else(|| crate::p9_emit::kuna_stackassign::load_pointer(fd, op)))
             .flatten();
@@ -13435,7 +13446,14 @@ fn array_decl_parts(
     let base = ct.get_array_base()?;
     let elsize = base.get_size().max(1);
     let count = ct.get_size() / elsize;
-    Some((type_name_for_decl(&base, rt.clone()), count))
+    // The ordinary type name omits anonymous array dimensions. They belong
+    // after the outer subscript when the C declaration has a nested array.
+    let parts = if rt.lang == crate::kuna_lang::OutLang::C && base.get_array_base().is_some() && base.get_name().is_empty() {
+        declarator_parts(&base, rt)
+    } else {
+        type_name_for_decl(&base, rt)
+    };
+    Some((parts, count))
 }
 
 /// Build the declarator front/back text bracketing an identifier for `ct`.
@@ -14692,6 +14710,10 @@ fn native_switch_label_signedness(
         .filter(|ct| ct.get_size() == vn.get_size())
         .unwrap_or_else(|| vn.get_type_read_facing(op).clone());
     printed_integer_signedness(&ct, signed_text_byte)
+}
+
+fn float_array(ty: &crate::dtype::Datatype) -> bool {
+    ty.get_array_base().is_some_and(|t| t.get_metatype() == crate::dtype::type_metatype::TYPE_FLOAT)
 }
 
 /// A single array member occupies every byte of the record.

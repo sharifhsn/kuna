@@ -18,6 +18,14 @@ Field order, optional fields, numeric spelling and the trailing newline are pres
 `scripts/bench_functions_macho.py` generates an arm64 Mach-O with a configurable
 number of one-instruction functions for reproducing inventory memory measurements.
 
+C local declarations preserve every dimension of an anonymous nested array.
+For example, four pairs of floats are declared as `float v[4][2]`, which
+makes `v[0][i]` a scalar float access. When a declared input supplies a
+whole float-array value read from memory, the printer can move those bytes
+into the first equal-sized, equal-element-width subarray of a local. It uses
+the existing safe-load checks before rendering the move. This rule uses
+known types and leaves function signature inference unchanged.
+
 An integer SUBPIECE of an implied struct value preserves the extracted width
 when rendered as a field access (`kuna_fieldextract.rs`). If the field is wider
 than the result, the emitter converts the field to the operation's integer type

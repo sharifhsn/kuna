@@ -2967,3 +2967,25 @@ lld-link-19 /nodefaultlib /entry:mainCRTStartup /subsystem:console /debug:full /
   '/pdbsourcepath:C:\kuna-fixtures' /pdb:pdb_float_lanes.pdb /pdbaltpath:pdb_float_lanes.pdb \
   /out:pdb_float_lanes.exe pdb_float_lanes.obj
 ```
+
+
+### Freestanding MSVC float-lane image
+
+`msvc_float_lanes.exe` uses the same `pdb_float_lanes.c` source with the x64
+MSVC optimizer and no PDB. The fixture's own source entry checks both lanes.
+The 2,560-byte image links just the source object and a float-runtime marker.
+Its SHA-256 is `f95362332b9d070bf3608efb7a7ffe7ee5152bb8ed3c313a2e3dbd9e3ef7c2f6`.
+From an x64 Visual Studio Developer Command Prompt:
+
+```bat
+cl /nologo /W4 /WX /TC /O2 /GL- /DmainCRTStartup=sample_reference_check /D_fltused=sample_unused /c pdb_float_lanes.c
+echo int _fltused; > float_marker.c
+cl /nologo /W4 /WX /c /TC /O2 /Zl float_marker.c
+link /nologo /nodefaultlib /subsystem:console /entry:sample_reference_check /include:sample_lane /debug:none /brepro /map:minimal.map /out:minimal.exe pdb_float_lanes.obj float_marker.obj
+minimal.exe
+```
+
+The checked-in image is the resulting `minimal.exe`. The link map identifies
+`sample_lane` at `0x140001000` in this build. The export regression provides
+the struct and public function declaration and verifies the C output with a
+separate consumer. [Native MSVC fixture check](https://github.com/sharifhsn/kuna/actions/runs/45877081729)
