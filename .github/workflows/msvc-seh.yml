@@ -1,9 +1,7 @@
 name: MSVC x64 SEH source fixture
 on:
   push:
-    paths:
-      - 'decompiler/crates/kuna-analysis/tests/fixtures/msvc-seh/**'
-      - '.github/workflows/msvc-seh.yml'
+    branches: [validation/issue-3-native-roundtrip]
   workflow_dispatch:
 permissions:
   contents: read
@@ -20,4 +18,12 @@ jobs:
           for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "vs=%%i"
           if not defined vs exit /b 1
           call "%vs%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
-          python check_roundtrip.py
+          cl /nologo /W3 /we4013 /O2 /EHa /TC /Z7 scopes.c helpers.c check.c /Fe:scopes.exe /link /DEBUG:FULL /PDB:scopes.pdb /PDBALTPATH:scopes.pdb /INCREMENTAL:NO || exit /b 1
+          scopes.exe || exit /b 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: source-built-seh
+          retention-days: 3
+          path: |
+            decompiler/crates/kuna-analysis/tests/fixtures/msvc-seh/scopes.exe
+            decompiler/crates/kuna-analysis/tests/fixtures/msvc-seh/scopes.pdb
