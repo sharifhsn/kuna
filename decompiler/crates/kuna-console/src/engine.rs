@@ -4898,7 +4898,7 @@ pub(crate) fn bootstrap_raw_image(
     path: &str,
     target: &str,
     base: u64,
-    entries: &[u64],
+    entries: Option<&[u64]>,
     isa: Option<ArmIsa>,
     languages: &(impl Languages + ?Sized),
     bytes: Option<Vec<u8>>,
@@ -4908,11 +4908,13 @@ pub(crate) fn bootstrap_raw_image(
             "raw image input requires --target <SLEIGH-language-id>",
         ));
     }
-    if entries.is_empty() {
-        return Err(KunaError::lowlevel(
+    let entries = match entries {
+        Some([]) => return Err(KunaError::lowlevel(
             "raw image input requires at least one --entry or --addr",
-        ));
-    }
+        )),
+        Some(entries) => entries,
+        None => &[],
+    };
 
     let registry = build_registry();
     let capability = RawBinaryArchitectureCapability::new();
@@ -5165,7 +5167,7 @@ pub(crate) fn bootstrap_mz_bytes(
         path,
         target,
         image.base,
-        &[entry],
+        Some(&[entry]),
         isa,
         languages,
         Some(image.module.clone()),
@@ -5667,6 +5669,7 @@ pub(crate) fn bootstrap_object(
         &kuna_sleigh::loadimage::LoadImage::get_segments(&loader),
     );
     let globalref_ranges: Vec<(u64, u64)> = loader.data_object_ranges().to_vec();
+    let section_table = !loader.section_metadata().is_empty();
     let cstring_ranges: Vec<(u64, u64)> =
         kuna_decomp::kuna_cstringconst::literal_sections(
             loader.section_metadata().iter().map(|s| (s.name.as_str(), s.kind.as_str(), s.vma, s.size)),
@@ -5903,6 +5906,7 @@ pub(crate) fn bootstrap_object(
 
     // (kuna `globalref`) ... and the sections a program's data objects live in.
     prog.arch_mut().globalref_ranges = std::rc::Rc::new(globalref_ranges);
+    prog.arch_mut().section_table = section_table;
     // (kuna `cstringconst`) ... and the sections that hold only string literals.
     prog.arch_mut().cstring_ranges = std::rc::Rc::new(cstring_ranges);
 

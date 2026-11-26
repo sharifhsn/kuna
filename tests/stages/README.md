@@ -12,9 +12,10 @@ unbounded 32-bit count as well, `never` drops the 64-bit shifts' guards,
 guard-free shift of a signed literal keeps its unsigned conversion.
 
 `kuna-elfv1-symbolextent.xml` checks that the gap walk (`aif`) names no function
-inside the code of a sized PowerPC64 ELFv1 symbol, in both byte orders, and keeps a
-routine with no symbol, a symbol inside another function, and a routine behind a
-descriptor that states its own size.
+inside the code of a sized PowerPC64 ELFv1 symbol, 28 or 24 bytes long, in both byte
+orders. It keeps a routine with no symbol, a symbol, a call target and a descriptor's
+code inside other functions, and a routine behind a descriptor symbol that states the
+descriptor's size beside a `.name` symbol.
 
 `kuna-returndup-auto.xml` checks option `returndup` (default `auto`) on gcc -O0
 x86-64: a guard clause `if (!c) return 0;` keeps its own return, a body that
@@ -98,6 +99,21 @@ return per path.
 the integer, the call and the field `s->next` beside it, a stand-alone
 `if (p)` and a chain that is a loop's condition stay truthy. Under `option
 truthycond on` every test is truthy.
+
+`kuna-ptrfromuse-faroffset.xml` checks option `ptrfromuse` on a parameter
+read only at field offsets of 0x1000 or more, in an x86-64 shared object, the
+same object stripped, an x86-64 non-PIE executable and an AArch64 shared
+object (`tests/fixtures/field-offset-pointers/`). Reads at 0x1000 and at
+0x48a0 make the parameter `void *`, as reads at 0xff8 always did, and the field
+at 0x1000 in the x86-64 shared object, whose first function also sits at
+0x1000, prints through the parameter instead of as `&near_leaf[a0]`. A
+parameter that indexes a `.data`, `.bss` or `.text` table, named or not, stays
+an integer. A fifth object has no data section at all, and its one function,
+at 0x1000, reads its own record at that offset. Two more images
+(`absolute.c`) pin the limits of the reading: a read of the absolute address
+0x40020000 at an offset in the parameter, a byte table at the start of
+`.rodata` indexed from a character (`letters[c - 'a']`), and a relocatable
+object's extern table each keep an integer parameter.
 
 `kuna-rangetest.xml` checks option `rangetest` (default `auto`) on gcc -O2
 x86-64, which folds two comparisons of one value into one unsigned comparison
@@ -183,6 +199,16 @@ recipe are in `tests/fixtures/ppc64-plt-stubs/`.
 image twice. With the catalog defaults its PIC stub stays `sub_1800`; after
 `mode aggressive`, which sets `ppc32picimports abi` and which `auto` selects
 for files under 500 KiB, the same call prints as the import `extra`.
+
+`kuna-mips-octeon-elf32-o64.xml` loads big-endian Octeon ELF32 images without a
+target: one declaring O64, one declaring no ABI with GCC's `.mdebug.abiO64`
+marker, and one declaring no ABI at all. Each now loads with the Octeon O64
+model, so `bbit0` keeps the CRC's bit-15 test and `describe` passes its five
+arguments, the fifth from the stack slot at SP + 32; they used to load as
+generic MIPS32, which read `bbit0` as a COP2 load and stopped at `sd ra`. A
+generic MIPS image with the same encoding keeps its COP2 load. A strict fix
+with one pass. The fixtures and their recipe are in
+`tests/fixtures/octeon-elf32/`.
 
 `kuna-narrowed-call-input.xml` checks a call through a typed field whose
 argument was narrowed to two bytes before the field's prototype was forced on
@@ -767,6 +793,8 @@ with undefined-behavior checks and exercises every case and signed boundaries.
 - `kuna-sparc-double-sign.xml`, `kuna-sparc64-double-sign.xml`: binary64 negation from a high-word `fnegs`, without a numeric high-word cast.
 
 - `kuna-sparc-register-pair.xml`: a SPARC32 register pair loaded whole by `ldd` on one path and set as two 32-bit values on the other keeps a loop index and a counter as separate locals (always on; without it they fuse into one 64-bit local updated with `CONCAT44`).
+
+- `kuna-sparc-trap-resume.xml`: a `ta 0x10` in the delay slot of `ba` lifts to the trap's `call` followed by the branch's `goto`, and a function is declared at the branch target. The `goto` is where the trap resumes, so the function prints the trap once and returns the resumed code's `3`, with no call to the declared function (always on; one pass, a strict fix).
 
 - `kuna-integer-float-rounding.xml`, `kuna-integer-float-rounding64.xml`, `kuna-integer-float-rounding-x87.xml`: an integer-to-float conversion keeps its rounding through a later float conversion or a narrower float trace (always on), while exact intermediates, x87 extended conversions and `fld1` still combine.
 

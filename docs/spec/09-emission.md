@@ -669,6 +669,13 @@ warnstyle banner` restores upstream Ghidra's full
 `/* WARNING: ... */` lines, exercised by
 `tests/stages/kuna-cnorm-warnstyle.xml`.
 
+The indirect-jump fallback warning belongs to the call operation that
+replaced the jump. `decompile_drive.rs (drain_pipeline_comments)` publishes
+it after simplification, ahead of the pipeline's own comments, for each
+bad-jump-table call that is still live. If analysis proves the path
+unreachable and removes that call, no warning is emitted for it, even when
+other operations from the same instruction survive.
+
 ## 9.1 Casts
 
 An equal-width `CAST` involving a complete struct or union transfers its object
@@ -4521,6 +4528,34 @@ corpus. The ranges bound which constant addresses become `&dat_<addr>`; a
 `dat_<addr>` the body already reads or writes directly is declared wherever it
 lies, a GOT slot or an import address table entry included (*The declaration*
 below).
+
+In an address space whose unit is larger than a byte (CP1600 `ram`, the AVR
+and PIC code spaces), a constant can be a machine word index without being a C
+object address. An exact symbol match does not prove that an untyped or integer
+constant is a pointer there:
+`decompiler/crates/kuna-decomp/src/p9_emit/coreaction_render.rs (is_pointer)`
+also requires address-use evidence in that space. Followed forward through at
+most three INT_ADD, COPY, INDIRECT or MULTIEQUAL steps
+(`coreaction_render.rs (search_for_space_attribute)`), the constant must become
+the address operand of a LOAD or STORE in that space, or reach a value whose
+pointer type names it. A CP1600 function declared to return `uint2` that
+returns 0x65a7 therefore prints `return 0x65a7;`, not `return (uint2)&cell;`.
+The pointer type inferred for the stack-base register (the cspec's stack
+pointer, CP1600 `R6`) is not an address use either. A constant COPYed into that
+register needs the same evidence when neither the constant nor the register is
+type-locked (`coreaction_render.rs (copies_to_inferred_stack_base)`). So a word
+index that a branch selects into `R6` and the function then returns as an
+integer keeps both numeric alternatives. Pointer-typed uses still resolve as
+addresses: the same function declared to return `uint2 *` prints
+`return &cell;`, and so does a constant passed to a declared pointer parameter,
+stored into a pointer-typed global, compared with a pointer, or held in `R6` and
+stored through. In both cases an exact function entry is still accepted, on the
+same two readings as the function-entry escape
+(`decompiler/crates/kuna-decomp/src/p5_types/kuna_inferfuncentry.rs
+(entry_escape_applies)`, applied by `coreaction_render.rs
+(lacks_word_address_use)`). A C function pointer on these targets is the
+entry's word address, so an AVR callback passed to an undeclared registration
+function keeps its name, and so does a function entry selected into `R6`.
 
 **What one function knows.** `kuna_globalref.rs (plan)` walks the function
 once when its document starts, and records three facts:

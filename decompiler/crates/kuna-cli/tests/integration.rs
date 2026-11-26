@@ -57,6 +57,8 @@ mod archive_members_cli;
 
 #[path = "assert_callee.rs"]
 mod assert_callee;
+#[path = "assert_named_data.rs"]
+mod assert_named_data;
 #[path = "stated_jump_targets.rs"]
 mod stated_jump_targets;
 
@@ -930,6 +932,8 @@ mod high_address_branches;
 
 #[path = "mips_import_flow.rs"]
 mod mips_import_flow;
+#[path = "octeon_elf32.rs"]
+mod octeon_elf32;
 
 #[path = "qualified_call.rs"]
 mod qualified_call;
@@ -974,3 +978,5 @@ mod bounds_checked_prototypes;
 
 #[path = "pdb_cli.rs"]
 mod pdb_cli;
+#[path = "post_call_resume.rs"]
+mod post_call_resume;
