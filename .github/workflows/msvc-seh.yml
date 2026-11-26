@@ -1,9 +1,7 @@
 name: MSVC x64 SEH source fixture
 on:
   push:
-    paths:
-      - 'decompiler/crates/kuna-analysis/tests/fixtures/msvc-seh/**'
-      - '.github/workflows/msvc-seh.yml'
+    branches: [validation/issue-3-consumer-controls]
   workflow_dispatch:
 permissions:
   contents: read
@@ -20,4 +18,12 @@ jobs:
           for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "vs=%%i"
           if not defined vs exit /b 1
           call "%vs%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
-          python check_roundtrip.py
+          python check_roundtrip.py --exported-c scopes.c || exit /b 1
+          python check_roundtrip.py --exported-c observed/scopes.exe.c > observed.log 2>&1
+          set "observed=%errorlevel%"
+          type observed.log
+          if not "%observed%"=="3" exit /b 1
+          findstr /c:"expected BQH, got BC" observed.log >nul || exit /b 1
+          findstr /c:"expected BFC, got BC" observed.log >nul || exit /b 1
+          findstr /c:"expected BQIO, got BC" observed.log >nul || exit /b 1
+          exit /b 0
