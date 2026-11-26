@@ -1,6 +1,6 @@
 # Windows x64 static runtime reference inputs
 
-Two Windows Server 2022 builds of a small C++ program using
+Three Windows Server 2022 builds of a small C++ program using
 `std::vector<std::string>` produced the same whole-library hashes. The
 reference environment was MSVC toolset **14.44.35207**, compiler file version
 **19.44.35230.0**, Windows SDK **10.0.26100.0**, targeting **x64**.
@@ -20,9 +20,32 @@ The linker's search log and public map both identify `libvcruntime.lib`
 for this static build. The similarly named `vcruntime.lib` exists in the
 same directory. Its members did not appear in the fixture map.
 
+## What the link map establishes
+
+The public-symbol section of this fixture's map has 472 function rows at
+440 distinct addresses. Of those addresses, 429 have one public name and 11
+have multiple names. Considering the four static CRT libraries in the table,
+419 addresses have only CRT owners, 18 have only other owners, and three
+have both. These counts use the linker’s function marker and exclude data
+symbols. They cover public entries only.
+
+A comparison that counts every map row as a separate function would count
+some starts more than once. Assigning each start the first name in the map
+would also hide ambiguous cases. Record those cases separately when
+reporting name accuracy. Actual false-positive and false-negative rates
+still require held-out predictions and ground truth.
+
 ## Verify the inputs
 
-In an x64 Developer PowerShell with that toolset and SDK selected, run:
+With those versions installed, open a command prompt in the Visual Studio
+installation directory and select the exact environment:
+
+```bat
+call VC\Auxiliary\Build\vcvarsall.bat x64 10.0.26100.0 -vcvars_ver=14.44.35207
+powershell -NoProfile
+```
+
+In that PowerShell session, print the selected versions and file hashes:
 
 ```powershell
 $env:VCToolsVersion
@@ -47,3 +70,4 @@ that comparison.
 
 [Fixture source and build procedure](https://github.com/sharifhsn/kuna/tree/af2ae4b555bff739377915476b5801652f2d43f5)
 · [Windows build and map](https://github.com/sharifhsn/kuna/actions/runs/45875267182)
+· [Explicit version-selection check](https://github.com/sharifhsn/kuna/actions/runs/45881986323)
