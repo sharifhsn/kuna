@@ -1288,6 +1288,7 @@ pub(crate) fn parse_args_for(argv: &[String], command: &str) -> Result<DisArgs, 
         }
     } else if raw_base.is_some() {
         return Err("--base requires --raw-image".into());
+    }
     if only_declared && func_decls.is_empty() {
         return Err("--only-declared requires at least one --define-function".into());
     }

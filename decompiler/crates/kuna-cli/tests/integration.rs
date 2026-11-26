@@ -980,3 +980,6 @@ mod bounds_checked_prototypes;
 mod pdb_cli;
 #[path = "post_call_resume.rs"]
 mod post_call_resume;
+
+#[path = "pdb_float_lanes.rs"]
+mod pdb_float_lanes;
