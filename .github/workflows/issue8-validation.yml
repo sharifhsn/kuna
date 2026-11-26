@@ -1,0 +1,31 @@
+name: MSVC x64 lane source reference
+on:
+  push:
+    branches: [validation/issue-8-msvc-reference]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  reference:
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile and execute the source oracle without debug symbols
+        shell: cmd
+        working-directory: decompiler/crates/kuna-analysis/tests/fixtures
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "vs=%%i"
+          if not defined vs exit /b 1
+          call "%vs%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          cl /nologo /W4 /WX /TC /O2 /GL- /DmainCRTStartup=sample_reference_check /D_fltused=sample_unused /c pdb_float_lanes.c || exit /b 1
+          cl /nologo /W4 /WX /TC /O2 /GL- lane_consumer.c pdb_float_lanes.obj /Fe:lanes.exe /link /DEBUG:NONE /MAP:lanes.map /INCREMENTAL:NO || exit /b 1
+          lanes.exe || exit /b 1
+          if exist lanes.pdb exit /b 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: source-built-lanes
+          retention-days: 3
+          path: |
+            decompiler/crates/kuna-analysis/tests/fixtures/lanes.exe
+            decompiler/crates/kuna-analysis/tests/fixtures/lanes.map
