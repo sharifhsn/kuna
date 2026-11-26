@@ -1,0 +1,24 @@
+name: MSVC x64 SEH source fixture
+on:
+  push:
+    paths:
+      - 'decompiler/crates/kuna-analysis/tests/fixtures/msvc-seh/**'
+      - '.github/workflows/msvc-seh.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  reference:
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile and run the six source paths
+        shell: cmd
+        working-directory: decompiler/crates/kuna-analysis/tests/fixtures/msvc-seh
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "vs=%%i"
+          if not defined vs exit /b 1
+          call "%vs%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          cl /nologo /W4 /WX /O2 /EHa /TC scopes.c check.c /Fe:scopes.exe || exit /b 1
+          scopes.exe
