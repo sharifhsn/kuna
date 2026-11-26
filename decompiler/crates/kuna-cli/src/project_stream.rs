@@ -1203,6 +1203,8 @@ fn export(
         summary_items.push(format!("{name} ({size} bytes)"));
     }
     let files = summary_items.join(", ");
+    let whole = args.addrs.is_empty() && args.names.is_none();
+    let coverage = whole.then(|| kuna_console::kuna_coverage::Code::of(&prog).measure_results(&writer.records));
     Ok(crate::decompile_project::ProjectCompletion {
         summary: format!(
             "wrote {}: {files}; functions: {} ok, {} failed{}\n",

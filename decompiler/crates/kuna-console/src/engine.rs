@@ -6106,6 +6106,7 @@ fn materialize_msvc_classes(
                         output_storage: None,
                         input_storage: Vec::new(),
                         kuna_library_names: None,
+                        kuna_library_table: false,
                     };
                     let code_ty = match thiscall_name {
                         Some(m) => types
@@ -6221,6 +6222,7 @@ fn materialize_msvc_classes(
                         output_storage: None,
                         input_storage: Vec::new(),
                         kuna_library_names: None,
+                        kuna_library_table: false,
                     },
                     thiscall_name,
                 ));
@@ -6237,6 +6239,7 @@ fn materialize_msvc_classes(
                         output_storage: None,
                         input_storage: Vec::new(),
                         kuna_library_names: None,
+                        kuna_library_table: false,
                     },
                     thiscall_name,
                 ));
