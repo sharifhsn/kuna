@@ -1,0 +1,31 @@
+name: MSVC x64 CRT provenance
+on:
+  push:
+    branches: [validation/issue-1-crt-provenance]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  reference:
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve SDK and toolset libraries and link the source fixture
+        shell: cmd
+        working-directory: .
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "vs=%%i"
+          if not defined vs exit /b 1
+          call "%vs%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          powershell -NoProfile -File ci-crt-provenance.ps1 || exit /b 1
+          cl /nologo /O2 /MT /EHsc fixture.cpp /link /out:fixture.exe /verbose:lib > link.log 2>&1 || (type link.log & exit /b 1)
+          fixture.exe || exit /b 1
+      - name: Save metadata and linker diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: crt-provenance
+          retention-days: 7
+          path: |
+            provenance.json
+            link.log
