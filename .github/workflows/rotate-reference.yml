@@ -1,0 +1,30 @@
+name: MSVC arithmetic return contract
+on:
+  push:
+    branches: [validation/issue-7-source-contract]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  reference:
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile and execute the value-returning paths
+        shell: cmd
+        working-directory: .
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "vs=%%i"
+          if not defined vs exit /b 1
+          call "%vs%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          cl /nologo /W4 /WX /O2 /TC /GL- /Zl /c core.c consumer.c || exit /b 1
+          link /nologo /nodefaultlib /entry:mainCRTStartup /subsystem:console /debug:none /brepro /include:rotate_or_forward /include:forward_word /map:case.map /out:case.exe core.obj consumer.obj || exit /b 1
+          case.exe || exit /b 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rotate-reference
+          retention-days: 5
+          path: |
+            case.exe
+            case.map
