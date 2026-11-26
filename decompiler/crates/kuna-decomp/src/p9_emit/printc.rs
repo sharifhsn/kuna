@@ -9992,13 +9992,35 @@ impl PrintC {
         if fd.vbank().get(input)?.get_size() != size {
             return None;
         }
-        let datatype = fd.vn_type_read_facing(input, op);
-        if datatype.get_metatype() != crate::dtype::type_metatype::TYPE_FLOAT
-            || datatype.get_size() != size
+        let input_type = fd.vn_type_read_facing(input, op);
+        let (name, datatype) = if input_type.get_metatype() == crate::dtype::type_metatype::TYPE_FLOAT
+            && input_type.get_size() == size
         {
-            return None;
-        }
-        let (name, _) = self.local_byte_array_name(fd, arch, output)?;
+            (self.local_byte_array_name(fd, arch, output)?.0, input_type)
+        } else {
+            if operation.code() != OpCode::CPUI_COPY {
+                return None;
+            }
+            let value = fd.vbank().get(output)?;
+            if value.is_implied() || value.is_persist() || value.is_volatile() {
+                return None;
+            }
+            let high = value.get_high()?;
+            let scope = fd.get_scope_local()?;
+            let symbol = fd.high_bank().get(high)?.kuna_link_symbol()?;
+            let record = scope.database().symbol(symbol);
+            if record.scope != scope.scope_id() || !record.is_type_locked() {
+                return None;
+            }
+            let (name, offset, _) = self.emitted_high_symbol(fd, high)?;
+            let declared = self.rendered_local_decl(fd, arch, high).4?;
+            if offset > 0 || declared.get_size() != size || !whole_array_record(&declared) {
+                return None;
+            }
+            crate::kuna_stackbytes::safe_load_op(fd, input, op)?;
+            crate::p9_emit::kuna_stackassign::loaded_bytes(fd, input)?;
+            (name, declared)
+        };
         Some(crate::p9_emit::kuna_stackassign::Assignment {
             output,
             operand: Some(input),
@@ -10020,7 +10042,8 @@ impl PrintC {
     ) {
         use crate::printlanguage::SyntaxHighlight;
         static COMPOUND: OpToken = op_token("", " }", 2, 66, false, TokenType::Postsurround, 0, 0);
-        let array_source = super::kuna_bytearrayc::byte_array(&assignment.datatype)
+        let array_source = (super::kuna_bytearrayc::byte_array(&assignment.datatype)
+            || whole_array_record(&assignment.datatype))
             .then(|| assignment.operand.and_then(|input| crate::p9_emit::kuna_stackassign::loaded_bytes(fd, input))
                 .or_else(|| crate::p9_emit::kuna_stackassign::load_pointer(fd, op)))
             .flatten();
@@ -14669,6 +14692,15 @@ fn native_switch_label_signedness(
         .filter(|ct| ct.get_size() == vn.get_size())
         .unwrap_or_else(|| vn.get_type_read_facing(op).clone());
     printed_integer_signedness(&ct, signed_text_byte)
+}
+
+/// A single array member occupies every byte of the record.
+fn whole_array_record(ty: &crate::dtype::Datatype) -> bool {
+    use crate::dtype::type_metatype::{TYPE_ARRAY, TYPE_STRUCT};
+    ty.get_metatype() == TYPE_STRUCT && ty.get_field(1).is_none()
+        && ty.get_field(0).is_some_and(|field| field.offset == 0
+            && field.field_type.get_metatype() == TYPE_ARRAY
+            && field.field_type.get_size() == ty.get_size())
 }
 
 /// Whether the output language spells the integer type `ct` signed; `None` for

@@ -2950,3 +2950,19 @@ first 11 bytes of each caller as a DWARF 5 inline site. Build it with
 vmrs APSR_nzcv, fpscr`, and `a32_cs_zero` on `cs` after `vcmpe.f32 s0, #0`; each
 returns 5 when the branch is taken and 3 otherwise. Used by
 `tests/stages/kuna-vcmp-carry.xml`.
+
+### Typed float-lane copy
+
+`pdb_float_lanes.c` copies a two-float record and returns the indexed lane.
+The CLI regression exports the typed function and checks the resulting C
+against both lanes of four input records. Regenerate the PE and PDB together
+with Clang 19 and LLD 19 from the fixture directory:
+
+```sh
+clang-19 --target=x86_64-pc-windows-msvc -O2 -g -gcodeview -ffreestanding \
+  -gno-codeview-command-line -mno-incremental-linker-compatible -ffile-compilation-dir=. \
+  -c pdb_float_lanes.c -o pdb_float_lanes.obj
+lld-link-19 /nodefaultlib /entry:mainCRTStartup /subsystem:console /debug:full /Brepro \
+  '/pdbsourcepath:C:\kuna-fixtures' /pdb:pdb_float_lanes.pdb /pdbaltpath:pdb_float_lanes.pdb \
+  /out:pdb_float_lanes.exe pdb_float_lanes.obj
+```

@@ -974,3 +974,6 @@ mod bounds_checked_prototypes;
 
 #[path = "pdb_cli.rs"]
 mod pdb_cli;
+
+#[path = "pdb_float_lanes.rs"]
+mod pdb_float_lanes;
