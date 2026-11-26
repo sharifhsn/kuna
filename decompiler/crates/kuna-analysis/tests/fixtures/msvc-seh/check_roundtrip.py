@@ -3,6 +3,7 @@ import argparse
 import os
 from pathlib import Path
 import subprocess
+import sys
 from tempfile import TemporaryDirectory
 
 FIXTURE = Path(__file__).resolve().parent
@@ -54,4 +55,8 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except subprocess.CalledProcessError as error:
+        print(f"{error.cmd[0]} exited with status {error.returncode}", file=sys.stderr)
+        sys.exit(error.returncode)
