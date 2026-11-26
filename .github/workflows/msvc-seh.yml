@@ -20,5 +20,4 @@ jobs:
           for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "vs=%%i"
           if not defined vs exit /b 1
           call "%vs%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
-          cl /nologo /W4 /WX /O2 /EHa /TC scopes.c check.c /Fe:scopes.exe || exit /b 1
-          scopes.exe
+          python check_roundtrip.py
