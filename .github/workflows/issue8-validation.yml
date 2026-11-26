@@ -1,7 +1,7 @@
 name: MSVC x64 lane source reference
 on:
   push:
-    branches: [validation/issue-8-msvc-reference]
+    branches: [validation/issue-8-msvc-minimal]
   workflow_dispatch:
 permissions:
   contents: read
@@ -22,6 +22,10 @@ jobs:
           cl /nologo /W4 /WX /O2 /GL- /Tclane_consumer.c pdb_float_lanes.obj /Fe:lanes.exe /link /DEBUG:NONE /MAP:lanes.map /INCREMENTAL:NO || exit /b 1
           lanes.exe || exit /b 1
           if exist lanes.pdb exit /b 1
+          echo int _fltused; > float_marker.c
+          cl /nologo /W4 /WX /c /TC /O2 /Zl float_marker.c || exit /b 1
+          link /nologo /nodefaultlib /subsystem:console /entry:sample_reference_check /include:sample_lane /debug:none /brepro /map:minimal.map /out:minimal.exe pdb_float_lanes.obj float_marker.obj || exit /b 1
+          minimal.exe || exit /b 1
       - uses: actions/upload-artifact@v4
         with:
           name: source-built-lanes
@@ -29,3 +33,5 @@ jobs:
           path: |
             decompiler/crates/kuna-analysis/tests/fixtures/lanes.exe
             decompiler/crates/kuna-analysis/tests/fixtures/lanes.map
+            decompiler/crates/kuna-analysis/tests/fixtures/minimal.exe
+            decompiler/crates/kuna-analysis/tests/fixtures/minimal.map
