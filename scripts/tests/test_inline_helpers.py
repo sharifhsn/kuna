@@ -35,6 +35,22 @@ class InlineHelperReportTest(unittest.TestCase):
         self.assertEqual([(s["depth"], s["ranges"]) for s in groups[0]["sites"]],
                          [(0, first["ranges"]), (1, second["ranges"])])
 
+    def test_report_order_and_counts_are_independent_of_inventory_order(self):
+        site = dict(source="pdb", id="0x1", name="mix", depth=0, ranges=[["0x20", "0x24"]])
+        callers = [dict(name="b", address_hex="0x20", inline_sites=[site, dict(site, id="0x2")]),
+                   dict(name="a", address_hex="0xf", inline_sites=[dict(site, ranges=[["0xf", "0x11"]])])]
+        inventory = dict(binary="demo", count=2, total=2, error=None, functions=callers)
+        first = self.run_report(inventory)
+        callers.reverse()
+        callers[1]["inline_sites"].reverse()
+        second = self.run_report(inventory)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(first.stdout, second.stdout)
+        report = json.loads(first.stdout)
+        self.assertEqual([r["sites"] for r in report["caller_counts"]], [1, 2])
+        self.assertEqual([h["site_count"] for h in report["helpers"]], [2, 1])
+
     def test_failed_inventory_is_reported_as_an_error(self):
         p = self.run_report({"error": "fixture failed to load", "functions": []})
         self.assertNotEqual(p.returncode, 0)

@@ -14,10 +14,13 @@ def helper_report(inventory, name):
         raise ValueError("function list does not match inventory count")
 
     groups = {}
+    caller_counts = []
     for caller in functions:
+        count = 0
         for site in caller.get("inline_sites", []):
             if name is not None and name != site["name"]:
                 continue
+            count += 1
             key = (site["source"], site["id"])
             if key not in groups:
                 groups[key] = dict(source=site["source"], id=site["id"], name=site["name"], sites=[])
@@ -31,11 +34,20 @@ def helper_report(inventory, name):
                 "ranges": site["ranges"],
             })
 
+        if count:
+            caller_counts.append(dict(caller=caller["name"], address=caller["address_hex"], sites=count))
+
+    for helper in groups.values():
+        helper["sites"].sort(key=lambda site: (int(site["caller_address"], 16), site["depth"],
+                                               site["ranges"], site["caller"]))
+        helper["site_count"] = len(helper["sites"])
+
     report = {
         "binary": inventory["binary"],
         "inventory_count": len(functions),
         "inventory_total": inventory["total"],
-        "helpers": list(groups.values()),
+        "helpers": [groups[key] for key in sorted(groups)],
+        "caller_counts": sorted(caller_counts, key=lambda row: (int(row["address"], 16), row["caller"])),
     }
     for field in ("limits", "notes"):
         if field in inventory:

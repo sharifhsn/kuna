@@ -23,7 +23,8 @@ From the checkout, run `python3 scripts/inline_helpers.py functions.json --name 
 to list that helper's callers, nesting depths, and half-open address ranges.
 Omitting `--name` lists all helpers. Identities are scoped to one inventory and
 debug format. Separate calls within one caller and disjoint ranges within one
-call stay distinct. The report preserves the inventory's selection counts and limits.
+call stay distinct. Each helper includes a site count. The caller_counts array
+counts selected compiler-recorded sites by caller in address order. The report preserves the inventory's selection counts and limits.
 
 With Gemini's PDB, the report preserved all 1,937 inline sites across 725
 helper identities. The fixture source accounts for all 13 sites of
