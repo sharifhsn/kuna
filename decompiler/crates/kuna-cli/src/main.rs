@@ -42,6 +42,7 @@ mod skill;
 mod specs;
 mod strings;
 mod test;
+mod twins;
 mod unpack;
 mod xrefs;
 
@@ -62,6 +63,7 @@ const COMMANDS: &[(&str, CommandHandler)] = &[
     ("disassemble", disassemble::run),
     ("raw-pcode", disassemble::raw_pcode::run),
     ("read", disassemble::run_read),
+    ("twins", twins::run),
     ("xrefs", xrefs::run),
     ("strings", strings::run),
     ("crypto", crypto::run),
@@ -162,6 +164,8 @@ fn usage() {
          kuna decompile-graph <binary> [--isa auto|arm|thumb] [-o FILE] [--label TEXT] [--max-fn-seconds N] [--max-fn-memory MiB] [--mode auto|reliable|aggressive|fast] [--option N V]... [--define-function S[-E][=N]|@FILE]...\n\
          kuna query <db> [--rva 0x...] [--range 0xA..0xB] [--name PATTERN] [--helpers] [--json]\n\
          kuna functions <binary> [--isa auto|arm|thumb] [--json] [--jobs N|auto] [--mode auto|reliable|aggressive|fast] [--define-function S[-E][=N]|@FILE]... [--raw-image --target T --base VMA (--entry|--addr VMA)...]\n\
+         kuna twins <binary> --define-function S-E|@FILE.. [--min-bytes N] [--json]
+\
          kuna xrefs <binary> [--isa auto|arm|thumb] (--to <name|0xaddr> | --from <name|0xaddr>) [--json] [--kind call,jump,data,read,write] [--mode auto|reliable|aggressive|fast]\n\
          kuna crypto <binary> [--isa auto|arm|thumb] [--json] [--algorithm SUBSTR] [--section NAME] [--no-xrefs]\n\
          kuna blobs <binary> [--isa auto|arm|thumb] [--json] [--extract DIR] [--kind png,jpeg,gif,bmp,ico,zip,gzip,xz,zstd] [--section NAME] [--no-xrefs]\n\

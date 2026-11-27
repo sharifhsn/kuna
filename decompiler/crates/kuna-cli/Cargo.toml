@@ -58,6 +58,10 @@ name = "catalog_cli"
 path = "tests/catalog_cli.rs"
 
 [[test]]
+name = "twins_cli"
+path = "tests/twins_cli.rs"
+
+[[test]]
 name = "docs_cli"
 path = "tests/docs_cli.rs"
 

@@ -122,6 +122,7 @@ fn every_json_surface_names_its_root_in_help() {
         ("crypto", "{binary,"),
         ("blobs", "{binary,"),
         ("unpack", "{binary,"),
+        ("twins", "{groups,"),
         ("test", "{unit_footer,"),
         ("modes", "{modes:["),
         ("query", "{db,"),
